@@ -195,7 +195,7 @@ def test_detect_parallelism_norm_fallback():
     assert fsdp._detect_parallelism_type("weight", MyNorm()) == "replicated"
 
 
-def test_detect_parallelism_teliner_parallel_mode_variants():
+def test_detect_parallelism_telinear_parallel_mode_variants():
     fsdp = _make_fsdp_for_unit_tests()
 
     class TELinear(nn.Module):

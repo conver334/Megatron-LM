@@ -2627,9 +2627,15 @@ class ParamAndGradBuffer:
             del self.param_to_direct_module[old_param]
 
             new_param.requires_grad_(old_param.requires_grad)
-            for tp_attr in ["_tensor_parallel_mode"]:
-                if getattr(old_param, tp_attr, None) is not None:
-                    setattr(new_param, tp_attr, getattr(old_param, tp_attr))
+            for tp_attr in [
+                "_tensor_parallel_mode",
+                "tensor_model_parallel",
+                "partition_dim",
+                "partition_stride",
+            ]:
+                val = getattr(old_param, tp_attr, None)
+                if val is not None:
+                    setattr(new_param, tp_attr, val)
 
         for item_id, p in enumerate(self.params):
             if p in param_map:
@@ -2681,6 +2687,44 @@ class ParamAndGradBuffer:
             if group.hsdp_gbuf:
                 group.hsdp_gbuf.data.zero_()
 
+    def _ensure_tp_annotations(self):
+        """Ensure all parameters have _tensor_parallel_mode set by checking parent modules."""
+        _TP_COLUMN_TYPES = {
+            "ColumnParallelLinear",
+            "TEColumnParallelLinear",
+            "TELayerNormColumnParallelLinear",
+            "TEColumnParallelGroupedLinear",
+            "VocabParallelEmbedding",
+        }
+        _TP_ROW_TYPES = {
+            "RowParallelLinear",
+            "TERowParallelLinear",
+            "TERowParallelGroupedLinear",
+        }
+        for submodule in self.module.modules():
+            module_type = type(submodule).__name__
+            for param_name, param in submodule.named_parameters(recurse=False):
+                if hasattr(param, "_tensor_parallel_mode"):
+                    continue
+                if module_type == "TELayerNormColumnParallelLinear":
+                    if param_name.endswith("layer_norm_weight") or param_name.endswith(
+                        "layer_norm_bias"
+                    ):
+                        setattr(param, "_tensor_parallel_mode", "replicated")
+                        continue
+                    setattr(param, "_tensor_parallel_mode", "column")
+                    continue
+                if module_type in _TP_COLUMN_TYPES:
+                    setattr(param, "_tensor_parallel_mode", "column")
+                elif module_type in _TP_ROW_TYPES:
+                    setattr(param, "_tensor_parallel_mode", "row")
+                elif module_type == "TELinear":
+                    pm = getattr(submodule, "parallel_mode", None)
+                    if pm == "column":
+                        setattr(param, "_tensor_parallel_mode", "column")
+                    elif pm == "row":
+                        setattr(param, "_tensor_parallel_mode", "row")
+
     def _init_distributed_params(self):
         """
         Register model training and high-precision parameters as optimizer
@@ -2689,6 +2733,8 @@ class ParamAndGradBuffer:
         on mbuf -> wbuf -> orig_param depending on if main_params_dtype is
         specified or "no_shard" is utilized.
         """
+        self._ensure_tp_annotations()
+
         dist_main_weight = {}
         for pg in self.parameter_groups:
             wbuf = pg.model_weight_buffer
@@ -2697,16 +2743,9 @@ class ParamAndGradBuffer:
             for item_id, orig_param in enumerate(pg.params):
                 param_name = self.param_to_name[orig_param]
 
-                # If the optimizer state is sharded, we need to track references to shards
-                # of the main weight or training weight buffer data for distributed
-                # optimization, regardless whether the buffers are sharded or not.
-                # mbuf and wbuf won't exist in the case of "no_shard", in which case
-                # we simply take the original unsharded parameter weight from the model.
                 sharded_optimizer_state = (
                     self.bucketing_policy.data_parallel_sharding_strategy != "no_shard"
                 )
-
-                # Register model training and high-precision parameters as DTensor(s).
                 if mbuf:
                     dist_param = make_fsdp_dtensor(
                         local_tensor=mbuf.get_item(item_id, only_shard=sharded_optimizer_state),

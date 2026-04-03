@@ -281,7 +281,7 @@ def uneven_dtensor_to_full_tensor(dtensor: DTensor) -> torch.Tensor:
         >>> mesh = DeviceMesh("cuda", [0, 1, 2, 3])
         >>> # Create a DTensor with uneven sharding
         >>> dtensor = DTensor(..., placements=[Shard(0)])
-        >>> full_tensor = gather_uneven_dtensor_to_full_tensor(dtensor)
+        >>> full_tensor = uneven_dtensor_to_full_tensor(dtensor)
         >>> assert full_tensor.shape == dtensor.shape
     """
     # Validate input type
@@ -350,12 +350,6 @@ def uneven_dtensor_to_full_tensor(dtensor: DTensor) -> torch.Tensor:
         chunk_tensor = local_buffer[buffer_offset : buffer_offset + chunk_numel].view(chunk_shape)
         all_local_chunks.append(chunk_tensor)
         buffer_offset += chunk_numel
-
-    debug_slices = []
-    for chunk_info, local_chunk in zip(local_chunks_info, all_local_chunks):
-        offset = chunk_info["offset"]
-        slices = tuple(slice(o, o + s) for o, s in zip(offset, local_chunk.shape))
-        debug_slices.append(slices)
 
     # Reconstruct the full tensor by placing chunks at their correct offsets
     full_tensor = torch.zeros(dtensor.shape, dtype=dtensor.dtype, device=dtensor.device)
