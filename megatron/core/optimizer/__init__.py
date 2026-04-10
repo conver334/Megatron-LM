@@ -548,6 +548,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 "weight_decay": config.weight_decay,
                 "betas": (config.adam_beta1, config.adam_beta2),
                 "eps": config.adam_eps,
+                "capturable": config.optimizer_cuda_graph,
             }
 
             # set Adam class and weight decay mode depending
@@ -850,7 +851,7 @@ def _get_megatron_emerging_optimizer(
             pg_collection,
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks if config.overlap_param_gather else None,
-            async_allgather=config.overlap_param_gather,
+            overlap_param_gather=config.overlap_param_gather,
         )
 
     return ChainedOptimizer(results)
