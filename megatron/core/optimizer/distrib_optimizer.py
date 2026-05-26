@@ -1622,6 +1622,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # each local shard as replicated data. Its fp32 master params duplicate
         # Megatron-FSDP's model-state main weights, so they are intentionally not
         # stored in the optimizer state.
+        param_name_to_param = {
+            self._param_name(param): param
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+        }
+
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             packed_state = self._pack_hybrid_optimizer_fsdp_state_dict()
         else:
@@ -1629,9 +1635,44 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
                 for k, v in self.state.items()
             }
+        self._set_fsdp_optimizer_state_chunk_metadata(packed_state, param_name_to_param)
 
         state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
         return state_dict
+
+    def _get_flat_fsdp_dtensor_tp_offset(
+        self, param: torch.nn.Parameter, param_name: str, is_expert_param: bool
+    ) -> int:
+        """Return the flattened TP offset for a parameter-local optimizer state."""
+        if getattr(param, "_tensor_parallel_mode", None) not in ("column", "row"):
+            return 0
+
+        dist_index = param.megatron_fsdp_dist_index
+        tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=is_expert_param)
+        tp_world_size = tp_mesh.mesh.numel()
+        assert param.numel() % tp_world_size == 0, (
+            f"FSDP optimizer TP state for {param_name} has numel={param.numel()} "
+            f"not divisible by TP={tp_world_size}."
+        )
+        tp_rank = torch.distributed.get_rank(tp_mesh.get_group())
+        return tp_rank * (param.numel() // tp_world_size)
+
+    def _set_fsdp_optimizer_state_chunk_metadata(
+        self, packed_state: dict[str, Any], param_name_to_param: dict[str, torch.nn.Parameter]
+    ) -> None:
+        """Attach non-collective DCP metadata to flat optimizer-state DTensors."""
+        for param_name, param_state in packed_state.items():
+            if param_name not in param_name_to_param or not isinstance(param_state, dict):
+                continue
+
+            param = param_name_to_param[param_name]
+            is_expert_param = "mlp.experts" in param_name
+            tp_offset = self._get_flat_fsdp_dtensor_tp_offset(param, param_name, is_expert_param)
+            for value in param_state.values():
+                if isinstance(value, DTensor) and value.dim() == 1:
+                    self._set_flat_fsdp_dtensor_chunk_metadata(
+                        value, param.megatron_fsdp_slice, tp_offset=tp_offset
+                    )
 
     def _pack_hybrid_optimizer_fsdp_state_dict(self) -> dict[str, Any]:
         """Pack HybridDeviceOptimizer state in a deterministic cross-rank order."""
@@ -1722,6 +1763,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 flat_param = torch.empty(param.numel(), device="meta")
                 try:
+                    tp_offset = self._get_flat_fsdp_dtensor_tp_offset(
+                        param, param_name, is_expert_param
+                    )
+
                     value = make_fsdp_dtensor(
                         value.data.view(-1),
                         flat_param,
@@ -1731,7 +1776,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         update_uneven_dtensor_chunk_meta=False,
                     )
                     self._set_flat_fsdp_dtensor_chunk_metadata(
-                        value, param.megatron_fsdp_slice
+                        value, param.megatron_fsdp_slice, tp_offset=tp_offset
                     )
                 except Exception as exc:
                     rank = torch.distributed.get_rank()
@@ -1744,12 +1789,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return packed_state
 
     @staticmethod
-    def _set_flat_fsdp_dtensor_chunk_metadata(tensor: DTensor, fsdp_slice: slice) -> None:
+    def _set_flat_fsdp_dtensor_chunk_metadata(
+        tensor: DTensor, fsdp_slice: slice, tp_offset: int = 0
+    ) -> None:
         """Attach DCP chunk metadata for a flat FSDP-local shard without collectives."""
         local_numel = fsdp_slice.stop - fsdp_slice.start
         chunk_meta = ChunkStorageMetadata(
-            offsets=(fsdp_slice.start,),
-            sizes=(local_numel,),
+            offsets=(tp_offset + fsdp_slice.start,), sizes=(local_numel,)
         )
 
         def _chunk_list_closure(chunk_metadata):
@@ -1774,8 +1820,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             return _write_items
 
+        tensor.__create_chunk_list__ = _chunk_list_closure(chunk_meta)
+        tensor.__create_write_items__ = _write_items_closure(chunk_meta)
+        tensor._megatron_fsdp_explicit_chunk_metadata = True
         tensor._local_tensor.__create_chunk_list__ = _chunk_list_closure(chunk_meta)
         tensor._local_tensor.__create_write_items__ = _write_items_closure(chunk_meta)
+        tensor._local_tensor._megatron_fsdp_explicit_chunk_metadata = True
 
     def sharded_param_state_dp_zero(
         self,

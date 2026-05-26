@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import re
 
 import torch
@@ -24,7 +25,13 @@ logger = logging.getLogger(__name__)
 try:
     from torch.distributed import DeviceMesh
     from torch.distributed._tensor import DTensor
-    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+    from torch.distributed.checkpoint.metadata import (
+        ChunkStorageMetadata,
+        MetadataIndex,
+        TensorProperties,
+        TensorStorageMetadata,
+    )
+    from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
     from torch.distributed.tensor.placement_types import Replicate, Shard
 
     from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
@@ -47,6 +54,81 @@ from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
+
+
+def _set_explicit_dtensor_chunk_metadata(dtensor: "DTensor", offsets, sizes):
+    """Attach DCP chunk metadata for a DTensor whose local shard is not rank-contiguous."""
+    chunk_meta = ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(sizes))
+
+    def _chunk_list():
+        return [chunk_meta]
+
+    def _write_items(fqn: str, tensor: "DTensor"):
+        if tensor.to_local().numel() == 0:
+            return []
+        return [
+            WriteItem(
+                type=WriteItemType.SHARD,
+                index=MetadataIndex(fqn, chunk_meta.offsets),
+                tensor_data=TensorWriteData(
+                    chunk=chunk_meta,
+                    properties=TensorProperties.create_from_tensor(tensor.to_local()),
+                    size=tensor.size(),
+                ),
+            )
+        ]
+
+    dtensor.__create_chunk_list__ = _chunk_list
+    dtensor.__create_write_items__ = _write_items
+    dtensor._megatron_fsdp_explicit_chunk_metadata = True
+    dtensor._local_tensor.__create_chunk_list__ = _chunk_list
+    dtensor._local_tensor.__create_write_items__ = _write_items
+    dtensor._local_tensor._megatron_fsdp_explicit_chunk_metadata = True
+
+
+def _validate_explicit_dtensor_chunk_metadata(dtensor: "DTensor", offsets, sizes):
+    """Validate explicitly supplied chunk metadata without recomputing rank-order offsets."""
+    assert all(
+        [
+            0 <= offset and offset + size <= dtensor.shape[dim]
+            for dim, (offset, size) in enumerate(zip(offsets, sizes))
+        ]
+    ), (
+        "[Megatron-FSDP] Explicit DTensor chunk metadata is invalid. "
+        f"Offsets: {tuple(offsets)}, "
+        f"Sizes: {tuple(sizes)}, "
+        f"Global shape: {dtensor.shape}, "
+        f"Local shape: {dtensor.to_local().shape}, "
+        f"Device mesh: {dtensor.device_mesh}."
+    )
+
+    if torch.distributed.is_initialized() and torch.distributed.get_backend() == 'fake':
+        return
+
+    boundary_checks = torch.tensor(
+        [
+            [offset == 0, offset + size == dtensor.shape[dim]]
+            for dim, (offset, size) in enumerate(zip(offsets, sizes))
+        ],
+        dtype=torch.int,
+        device=dtensor.device,
+    )
+
+    for mesh_dim, placement in enumerate(dtensor.placements):
+        if isinstance(placement, Shard):
+            torch.distributed.all_reduce(
+                boundary_checks,
+                op=torch.distributed.ReduceOp.MAX,
+                group=dtensor.device_mesh.get_group(mesh_dim),
+            )
+    assert torch.all(boundary_checks), (
+        "[Megatron-FSDP] Explicit DTensor chunk metadata boundary check failed. "
+        f"Offsets: {tuple(offsets)}, "
+        f"Sizes: {tuple(sizes)}, "
+        f"Global shape: {dtensor.shape}, "
+        f"Local shape: {dtensor.to_local().shape}, "
+        f"Device mesh: {dtensor.device_mesh}."
+    )
 
 
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
@@ -518,7 +600,9 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         dist_index = dist_param.megatron_fsdp_dist_index
         tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=False)
 
-        data_size = dist_param.numel() // tp_mesh.mesh.numel()
+        data_size = dist_param.numel()
+        if is_mcore_tensor_model_parallel(dist_param):
+            data_size //= tp_mesh.mesh.numel()
         elems_per_unit = data_size // total_split
 
         if isinstance(data, DTensor):
@@ -564,15 +648,50 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             meta_shape[split_dim] = s
             meta = torch.empty(*meta_shape, device="meta")
             copy_tensor_model_parallel_attributes(meta, dist_param)
+            if (
+                tp_mesh.mesh.numel() > 1
+                and split_dim == 0
+                and global_shape[split_dim] == total_split
+                and not is_mcore_tensor_model_parallel(meta)
+            ):
+                # GDN fused parameters are TP-local but do not always carry MCore TP attrs.
+                # Mark the split tensors as column-sharded so DCP plans distinct TP chunks.
+                meta._tensor_parallel_mode = "column"
+
+            trailing_numel = math.prod(meta_shape[split_dim + 1 :])
+            assert trailing_numel > 0, f"Invalid GDN component shape: {meta_shape}"
+            component_start = 0
+            if shard.start != shard.stop:
+                component_start = shard.start - comp_slice.start
+                assert component_start % trailing_numel == 0, (
+                    f"GDN component shard is not aligned with tensor rows: "
+                    f"component_start={component_start}, trailing_numel={trailing_numel}, "
+                    f"meta_shape={meta_shape}, shard={shard}, comp_slice={comp_slice}"
+                )
+                assert comp_data.numel() % trailing_numel == 0, (
+                    f"GDN component shard size is not aligned with tensor rows: "
+                    f"numel={comp_data.numel()}, trailing_numel={trailing_numel}, "
+                    f"meta_shape={meta_shape}, shard={shard}, comp_slice={comp_slice}"
+                )
+
+            chunk_offsets = [0] * len(meta_shape)
+            chunk_offsets[split_dim] = component_start // trailing_numel
+            chunk_sizes = list(comp_data.shape)
+            tp_partition_dim = get_mcore_tensor_parallel_partition_dim(meta)
+            if tp_partition_dim is not None:
+                tp_rank = dist.get_rank(tp_mesh.get_group())
+                chunk_offsets[tp_partition_dim] += tp_rank * meta_shape[tp_partition_dim]
 
             dtensor = make_fsdp_dtensor(
                 comp_data.data,
                 meta,
                 dist_index=dist_index,
                 is_expert_param=False,
-                run_check=True,
-                update_uneven_dtensor_chunk_meta=True,
+                run_check=False,
+                update_uneven_dtensor_chunk_meta=False,
             )
+            _validate_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
+            _set_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
             results.append(dtensor)
             flat_offset += comp_flat
 

@@ -244,11 +244,19 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     visit_dtensor = filter_unflattened_state_dict(
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
     )
+
+    def _has_explicit_chunk_metadata(dtensor: DTensor) -> bool:
+        local_tensor = dtensor._local_tensor
+        marker = "_megatron_fsdp_explicit_chunk_metadata"
+        return getattr(dtensor, marker, False) or getattr(local_tensor, marker, False)
+
     # Sort the keys, since some state dictionaries are mocked
     # and extended to include empty global keys.
     for key_chain in sorted(visit_dtensor):
         # Get the DTensor at the key chain
         dtensor = get_unflattened_state_dict(state_dict, key_chain)
+        if _has_explicit_chunk_metadata(dtensor):
+            continue
         update_uneven_dtensor_chunk_metadata(dtensor)
     return state_dict
 
