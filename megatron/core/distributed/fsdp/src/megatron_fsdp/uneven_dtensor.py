@@ -25,6 +25,68 @@ from torch.distributed.checkpoint.metadata import (
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
+_EXPLICIT_CHUNK_METADATA_MARKER = "_megatron_fsdp_explicit_chunk_metadata"
+
+
+def _make_dcp_chunk_hooks(chunk_metadata: ChunkStorageMetadata):
+    def _chunk_list():
+        return [chunk_metadata]
+
+    def _write_items(fqn: str, dtensor: DTensor) -> List[WriteItem]:
+        if dtensor.to_local().numel() == 0:
+            return []
+
+        return [
+            WriteItem(
+                type=WriteItemType.SHARD,
+                index=MetadataIndex(fqn, chunk_metadata.offsets),
+                tensor_data=TensorWriteData(
+                    chunk=chunk_metadata,
+                    properties=TensorProperties.create_from_tensor(dtensor.to_local()),
+                    size=dtensor.size(),
+                ),
+            )
+        ]
+
+    return _chunk_list, _write_items
+
+
+def _set_dtensor_chunk_metadata(
+    dtensor: DTensor, chunk_metadata: ChunkStorageMetadata, explicit: bool = False
+) -> None:
+    """Attach DCP chunk metadata hooks to both DTensor and its local tensor."""
+    chunk_list_hook, write_items_hook = _make_dcp_chunk_hooks(chunk_metadata)
+    dtensor.__create_chunk_list__ = chunk_list_hook
+    dtensor.__create_write_items__ = write_items_hook
+    dtensor._local_tensor.__create_chunk_list__ = chunk_list_hook
+    dtensor._local_tensor.__create_write_items__ = write_items_hook
+    if explicit:
+        dtensor._megatron_fsdp_explicit_chunk_metadata = True
+        dtensor._local_tensor._megatron_fsdp_explicit_chunk_metadata = True
+
+
+def set_explicit_dtensor_chunk_metadata(dtensor: DTensor, offsets, sizes) -> None:
+    """Attach caller-provided DCP chunk metadata without rank-order collectives."""
+    assert all(
+        0 <= offset and offset + size <= dtensor.shape[dim]
+        for dim, (offset, size) in enumerate(zip(offsets, sizes))
+    ), (
+        "[Megatron-FSDP] Explicit DTensor chunk metadata is invalid.\n"
+        f"offsets={tuple(offsets)}, sizes={tuple(sizes)}, global_shape={dtensor.shape}, "
+    )
+    _set_dtensor_chunk_metadata(
+        dtensor,
+        ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(sizes)),
+        explicit=True,
+    )
+
+
+def has_explicit_dtensor_chunk_metadata(dtensor: DTensor) -> bool:
+    local_tensor = dtensor._local_tensor
+    return getattr(dtensor, _EXPLICIT_CHUNK_METADATA_MARKER, False) or getattr(
+        local_tensor, _EXPLICIT_CHUNK_METADATA_MARKER, False
+    )
+
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     """
@@ -100,29 +162,6 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     and write items closures for saving and loading.
     """
 
-    def _chunk_list_closure(chunk_meta):
-        return lambda: chunk_meta
-
-    def _write_items_closure(uneven_chunk_meta):
-        def _write_items(fqn: str, tensor: DTensor) -> List[WriteItem]:
-            if tensor.to_local().numel() == 0:
-                # If the tensor is empty, return an empty list
-                return []
-
-            return [
-                WriteItem(
-                    type=WriteItemType.SHARD,
-                    index=MetadataIndex(fqn, uneven_chunk_meta.offsets),
-                    tensor_data=TensorWriteData(
-                        chunk=uneven_chunk_meta,
-                        properties=TensorProperties.create_from_tensor(tensor.to_local()),
-                        size=tensor.size(),
-                    ),
-                )
-            ]
-
-        return _write_items
-
     # Get uneven chunk metadata for the DTensor
     # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
     # 1. Add pre-check validation to verify tensor shape consistency
@@ -130,10 +169,7 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     # 2. Implement batched barrier using grouped collectives
     #    to amortize synchronization overhead
     uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
-
-    # Set the chunk list and write items closure for the DTensor
-    dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
-    dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+    _set_dtensor_chunk_metadata(dtensor, uneven_chunk_meta)
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:
@@ -164,12 +200,9 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
             for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
         ]
     ), (
-        "[Megatron-FSDP] DTensor chunk metadata is invalid. "
-        f"Offsets: {chunk_meta.offsets}, "
-        f"Sizes: {chunk_meta.sizes}, "
-        f"Global shape: {dtensor.shape}, "
-        f"Local shape: {dtensor.to_local().shape}, "
-        f"Device mesh: {dtensor.device_mesh}."
+        "[Megatron-FSDP] DTensor chunk metadata is invalid.\n"
+        f"offsets={chunk_meta.offsets}, sizes={chunk_meta.sizes}, global_shape={dtensor.shape}, "
+        f"local_shape={dtensor.to_local().shape}"
     )
 
     # Check that all boundaries (start and end) are touched.
@@ -245,17 +278,12 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
     )
 
-    def _has_explicit_chunk_metadata(dtensor: DTensor) -> bool:
-        local_tensor = dtensor._local_tensor
-        marker = "_megatron_fsdp_explicit_chunk_metadata"
-        return getattr(dtensor, marker, False) or getattr(local_tensor, marker, False)
-
     # Sort the keys, since some state dictionaries are mocked
     # and extended to include empty global keys.
     for key_chain in sorted(visit_dtensor):
         # Get the DTensor at the key chain
         dtensor = get_unflattened_state_dict(state_dict, key_chain)
-        if _has_explicit_chunk_metadata(dtensor):
+        if has_explicit_dtensor_chunk_metadata(dtensor):
             continue
         update_uneven_dtensor_chunk_metadata(dtensor)
     return state_dict

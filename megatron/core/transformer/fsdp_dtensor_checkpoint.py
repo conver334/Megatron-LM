@@ -25,19 +25,14 @@ logger = logging.getLogger(__name__)
 try:
     from torch.distributed import DeviceMesh
     from torch.distributed._tensor import DTensor
-    from torch.distributed.checkpoint.metadata import (
-        ChunkStorageMetadata,
-        MetadataIndex,
-        TensorProperties,
-        TensorStorageMetadata,
-    )
-    from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.tensor.placement_types import Replicate, Shard
 
     from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        set_explicit_dtensor_chunk_metadata,
         split_dtensor,
         uneven_dtensor_to_full_tensor,
     )
@@ -54,81 +49,6 @@ from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
-
-
-def _set_explicit_dtensor_chunk_metadata(dtensor: "DTensor", offsets, sizes):
-    """Attach DCP chunk metadata for a DTensor whose local shard is not rank-contiguous."""
-    chunk_meta = ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(sizes))
-
-    def _chunk_list():
-        return [chunk_meta]
-
-    def _write_items(fqn: str, tensor: "DTensor"):
-        if tensor.to_local().numel() == 0:
-            return []
-        return [
-            WriteItem(
-                type=WriteItemType.SHARD,
-                index=MetadataIndex(fqn, chunk_meta.offsets),
-                tensor_data=TensorWriteData(
-                    chunk=chunk_meta,
-                    properties=TensorProperties.create_from_tensor(tensor.to_local()),
-                    size=tensor.size(),
-                ),
-            )
-        ]
-
-    dtensor.__create_chunk_list__ = _chunk_list
-    dtensor.__create_write_items__ = _write_items
-    dtensor._megatron_fsdp_explicit_chunk_metadata = True
-    dtensor._local_tensor.__create_chunk_list__ = _chunk_list
-    dtensor._local_tensor.__create_write_items__ = _write_items
-    dtensor._local_tensor._megatron_fsdp_explicit_chunk_metadata = True
-
-
-def _validate_explicit_dtensor_chunk_metadata(dtensor: "DTensor", offsets, sizes):
-    """Validate explicitly supplied chunk metadata without recomputing rank-order offsets."""
-    assert all(
-        [
-            0 <= offset and offset + size <= dtensor.shape[dim]
-            for dim, (offset, size) in enumerate(zip(offsets, sizes))
-        ]
-    ), (
-        "[Megatron-FSDP] Explicit DTensor chunk metadata is invalid. "
-        f"Offsets: {tuple(offsets)}, "
-        f"Sizes: {tuple(sizes)}, "
-        f"Global shape: {dtensor.shape}, "
-        f"Local shape: {dtensor.to_local().shape}, "
-        f"Device mesh: {dtensor.device_mesh}."
-    )
-
-    if torch.distributed.is_initialized() and torch.distributed.get_backend() == 'fake':
-        return
-
-    boundary_checks = torch.tensor(
-        [
-            [offset == 0, offset + size == dtensor.shape[dim]]
-            for dim, (offset, size) in enumerate(zip(offsets, sizes))
-        ],
-        dtype=torch.int,
-        device=dtensor.device,
-    )
-
-    for mesh_dim, placement in enumerate(dtensor.placements):
-        if isinstance(placement, Shard):
-            torch.distributed.all_reduce(
-                boundary_checks,
-                op=torch.distributed.ReduceOp.MAX,
-                group=dtensor.device_mesh.get_group(mesh_dim),
-            )
-    assert torch.all(boundary_checks), (
-        "[Megatron-FSDP] Explicit DTensor chunk metadata boundary check failed. "
-        f"Offsets: {tuple(offsets)}, "
-        f"Sizes: {tuple(sizes)}, "
-        f"Global shape: {dtensor.shape}, "
-        f"Local shape: {dtensor.to_local().shape}, "
-        f"Device mesh: {dtensor.device_mesh}."
-    )
 
 
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
@@ -690,8 +610,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 run_check=False,
                 update_uneven_dtensor_chunk_meta=False,
             )
-            _validate_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
-            _set_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
+            set_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
             results.append(dtensor)
             flat_offset += comp_flat
 
