@@ -1741,6 +1741,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     (fsdp_local_numel,), dtype=expected_tensor_state_dtypes[key], device="cpu"
                 )
 
+            if isinstance(value, DTensor) and key in expected_tensor_state_dtypes:
+                value = value.to_local().contiguous()
+
             if (
                 isinstance(value, torch.Tensor)
                 and not isinstance(value, DTensor)

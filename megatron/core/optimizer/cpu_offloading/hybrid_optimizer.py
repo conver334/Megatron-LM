@@ -401,7 +401,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param[param]
+            fp32_param = self.param_to_fp32_param.get(param)
+            if fp32_param is None:
+                continue
             master_param = v.get("master_param")
             if master_param is None:
                 master_param = _to_local_if_dtensor(param)
