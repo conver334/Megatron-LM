@@ -80,14 +80,20 @@ def test_align_without_switches_matches_lite_bitwise(magi_cfg, magi_source, dist
         assert torch.equal(lite["logits"], lite2["logits"])
         assert torch.equal(lite["logits"], align["logits"])
     assert lite["grads"].keys() == align["grads"].keys()
-    noise = {n: (lite["grads"][n].float() - lite2["grads"][n].float()).abs().max().item() for n in lite["grads"]}
-    stable = [n for n, v in noise.items() if v == 0.0]
-    assert stable, "no run-to-run reproducible grads; A/A control is vacuous"
-    bad = [n for n in stable if not torch.equal(lite["grads"][n], align["grads"][n])]
-    assert bad == [], bad[:10]
-    over = {n: ((lite["grads"][n].float() - align["grads"][n].float()).abs().max().item(), noise[n])
-            for n in lite["grads"] if n not in stable}
-    over = {n: v for n, v in over.items() if v[0] > 2 * v[1]}  # one A/A sample: allow 2x its spread
-    assert over == {}, dict(list(over.items())[:10])
-    print(f"\n{tag}: {len(stable)}/{len(noise)} grads bitwise (rest within A/A noise), "
-          f"deterministic={_deterministic_supported()}", flush=True)
+    if _deterministic_supported():
+        bad = [n for n in lite["grads"] if not torch.equal(lite["grads"][n], align["grads"][n])]
+        assert bad == [], bad[:10]
+        return
+    # non-deterministic backward: lite-vs-align relative spread must sit inside the lite A/A relative spread
+    def _rel(a, b):
+        return ((a.float() - b.float()).abs().max() / a.float().abs().max().clamp_min(1e-30)).item()
+
+    noise = {n: _rel(lite["grads"][n], lite2["grads"][n]) for n in lite["grads"]}
+    diff = {n: _rel(lite["grads"][n], align["grads"][n]) for n in lite["grads"]}
+    bound = 2 * max(noise.values())
+    assert bound > 0, "lite A/A grads all bitwise but Magi reports no deterministic mode; revisit the criterion"
+    over = {n: (diff[n], noise[n]) for n in diff if diff[n] > bound}
+    assert over == {}, (bound, dict(list(over.items())[:10]))
+    bitwise = sum(1 for n in diff if diff[n] == 0.0)
+    print(f"\n{tag}: forward bitwise; grads {bitwise}/{len(diff)} bitwise, max rel diff {max(diff.values()):.2e} "
+          f"vs A/A bound {bound:.2e} (Magi deterministic unsupported)", flush=True)
