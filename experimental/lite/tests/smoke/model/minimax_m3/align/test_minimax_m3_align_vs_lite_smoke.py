@@ -97,3 +97,15 @@ def test_align_without_switches_matches_lite_bitwise(magi_cfg, magi_source, dist
     bitwise = sum(1 for n in diff if diff[n] == 0.0)
     print(f"\n{tag}: forward bitwise; grads {bitwise}/{len(diff)} bitwise, max rel diff {max(diff.values()):.2e} "
           f"vs A/A bound {bound:.2e} (Magi deterministic unsupported)", flush=True)
+
+
+def test_control_unrolled_labels_change_the_loss(magi_cfg, magi_source, dist):
+    """Planted error: align with roll_labels=False on unrolled labels must not match lite (criterion can FAIL)."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+
+    _magi_deps()
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **L.MINIMAX_TRAINING_IMPL), pre_roll=True)
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=(), roll_labels=False))
+    assert not torch.equal(lite["loss"], align["loss"])
