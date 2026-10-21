@@ -117,7 +117,10 @@ register_model(
     "minimax_m3",
     package="megatron.lite.model.minimax_m3",
     hf_model_types=["minimax_m3_vl", "minimax_m3_vl_text", "minimax_m3"],
-    impls={"lite": "megatron.lite.model.minimax_m3.lite.protocol"},
+    impls={
+        "lite": "megatron.lite.model.minimax_m3.lite.protocol",
+        "align": "megatron.lite.model.minimax_m3.align.protocol",  # SGLang train-inference alignment
+    },
 )
 
 

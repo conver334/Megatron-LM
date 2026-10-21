@@ -231,6 +231,8 @@ def _temperature_to_float(temperature: float | torch.Tensor) -> float:
 
 
 class MiniMaxM3Model(nn.Module):
+    layer_cls: type[MiniMaxM3Layer] = MiniMaxM3Layer  # overridden by sibling impls (e.g. ``align``)
+
     def __init__(
         self,
         config: MiniMaxM3Config,
@@ -258,7 +260,7 @@ class MiniMaxM3Model(nn.Module):
         moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [
-                MiniMaxM3Layer(
+                self.layer_cls(
                     config,
                     ps,
                     idx,

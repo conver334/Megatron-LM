@@ -245,9 +245,18 @@ def _build_dist_opt_optimizer(chunks, model_cfg: MiniMaxM3Config, impl_cfg: Impl
     )
 
 
-def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+def build_model(
+    model_cfg: MiniMaxM3Config,
+    *,
+    impl_cfg: ImplConfig,
+    model_cls: type[nn.Module] | None = None,
+    extra_train_cfg: dict[str, Any] | None = None,
+) -> ModelBundle:
+    """``model_cls`` / ``extra_train_cfg`` let sibling impls (``align``) reuse this builder with their own layers."""
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
 
+    if model_cls is None:
+        model_cls = MiniMaxM3Model
     p = impl_cfg.parallel
     if impl_cfg.use_thd:
         raise NotImplementedError(
@@ -322,12 +331,13 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,
+        **(extra_train_cfg or {}),
     )
     if vpp is None:
-        chunks = [MiniMaxM3Model(model_cfg, train_cfg, ps).to(torch.bfloat16).cuda()]
+        chunks = [model_cls(model_cfg, train_cfg, ps).to(torch.bfloat16).cuda()]
     else:
         chunks = [
-            MiniMaxM3Model(model_cfg, train_cfg, ps, vpp_chunk_id=i).to(torch.bfloat16).cuda()
+            model_cls(model_cfg, train_cfg, ps, vpp_chunk_id=i).to(torch.bfloat16).cuda()
             for i in range(vpp)
         ]
     for chunk in chunks:
