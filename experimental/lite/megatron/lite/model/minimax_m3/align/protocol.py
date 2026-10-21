@@ -7,7 +7,7 @@ Wraps ``lite.protocol``: same config, checkpoint mapping, forward step and optim
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 
 import torch
 import torch.nn as nn
@@ -60,8 +60,8 @@ class ImplConfig(_lite.ImplConfig):
 
 
 def to_lite_impl_cfg(impl_cfg: ImplConfig) -> _lite.ImplConfig:
-    lite_fields = {f.name for f in fields(_lite.ImplConfig)}
-    values = {k: v for k, v in asdict(impl_cfg).items() if k in lite_fields}
+    # getattr, not asdict: asdict would flatten ParallelConfig/OptimizerConfig into dicts
+    values = {f.name: getattr(impl_cfg, f.name) for f in fields(_lite.ImplConfig)}
     # verl_mlite forces use_thd=True ("no-padding batches"); M3 consumes PackedBatch natively through Magi,
     # so the flag is satisfied by construction and must not trip lite's NotImplementedError.
     values["use_thd"] = False
