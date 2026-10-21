@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """``align`` with no align_modules must be bitwise identical to ``lite`` under the same ImplConfig knobs
-(forward logits/loss and every parameter gradient), on one GPU, single and packed documents."""
+(forward logits/loss and every parameter gradient), on one GPU, single and packed documents.
+A lite A/A run is the control: grads that are not run-to-run reproducible on this image (Magi builds without
+deterministic MSAV1 backward) are only required to stay within the A/A noise."""
 
 from __future__ import annotations
 
@@ -18,10 +20,21 @@ def _magi_deps():
     pytest.importorskip("msa_v1")
 
 
+def _deterministic_supported() -> bool:
+    from megatron.lite.primitive.kernels import magi_msa
+
+    try:
+        magi_msa.build_msa_config(magi_msa.MagiMsaSettings(deterministic=True))
+    except ValueError:
+        return False
+    return True
+
+
 def _impl_cfg(proto, **kw):
     from megatron.lite.runtime.contracts import ParallelConfig
 
-    return proto.ImplConfig(parallel=ParallelConfig(), optimizer=None, deterministic=True, magi_chunk_size=CHUNK, **kw)
+    return proto.ImplConfig(parallel=ParallelConfig(), optimizer=None, deterministic=_deterministic_supported(),
+                            magi_chunk_size=CHUNK, **kw)
 
 
 def _run(proto, cfg, src, seq_lens, impl_cfg, *, pre_roll=False):
@@ -59,10 +72,22 @@ def test_align_without_switches_matches_lite_bitwise(magi_cfg, magi_source, dist
     seq_lens = BATCHES[tag]
     knobs = dict(L.MINIMAX_TRAINING_IMPL)
     lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **knobs), pre_roll=True)
+    lite2 = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **knobs), pre_roll=True)  # A/A control
     align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=()))
+    assert torch.equal(lite["loss"], lite2["loss"]), "lite forward is not reproducible on this image"
     assert torch.equal(lite["loss"], align["loss"]), (lite["loss"].item(), align["loss"].item())
     if lite["logits"] is not None:
+        assert torch.equal(lite["logits"], lite2["logits"])
         assert torch.equal(lite["logits"], align["logits"])
     assert lite["grads"].keys() == align["grads"].keys()
-    bad = [n for n in lite["grads"] if not torch.equal(lite["grads"][n], align["grads"][n])]
+    noise = {n: (lite["grads"][n].float() - lite2["grads"][n].float()).abs().max().item() for n in lite["grads"]}
+    stable = [n for n, v in noise.items() if v == 0.0]
+    assert stable, "no run-to-run reproducible grads; A/A control is vacuous"
+    bad = [n for n in stable if not torch.equal(lite["grads"][n], align["grads"][n])]
     assert bad == [], bad[:10]
+    over = {n: ((lite["grads"][n].float() - align["grads"][n].float()).abs().max().item(), noise[n])
+            for n in lite["grads"] if n not in stable}
+    over = {n: v for n, v in over.items() if v[0] > v[1]}
+    assert over == {}, dict(list(over.items())[:10])
+    print(f"\n{tag}: {len(stable)}/{len(noise)} grads bitwise (rest within A/A noise), "
+          f"deterministic={_deterministic_supported()}", flush=True)
