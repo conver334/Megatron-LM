@@ -35,14 +35,17 @@ def test_matches_torch_semantics_and_breaks_ties_by_lowest_id():
     torch.manual_seed(0)
     logits = torch.randn(512, E, device="cuda")
     bias = torch.randn(E, device="cuda") * 0.05
-    logits[:8] = 0.0  # all-tie rows -> experts 0..3
     w, ids = moe_fused_gate(logits, bias, K, routed_scaling_factor=RSF, apply_routed_scaling_factor_on_output=True)
     assert ids.dtype == torch.int32 and w.dtype == torch.float32
     rw, rids = _torch_ref(logits, bias)
     assert torch.equal(ids.long(), rids)
-    assert torch.equal(ids[:8].long(), torch.arange(K, device="cuda").expand(8, K))
     torch.testing.assert_close(w, rw, rtol=1e-5, atol=1e-6)
     print(f"\nkernel vs torch weights bitwise mismatches: {(w != rw).sum().item()}/{w.numel()}")
+    # exact ties need equal sigmoid+bias: zero bias, zero logits -> experts 0..3 (lowest id), weight rsf/K each
+    tie = torch.zeros(8, E, device="cuda")
+    tw, tids = moe_fused_gate(tie, torch.zeros(E, device="cuda"), K, routed_scaling_factor=RSF, apply_routed_scaling_factor_on_output=True)
+    assert torch.equal(tids.long(), torch.arange(K, device="cuda").expand(8, K))
+    assert torch.equal(tw, torch.full((8, K), RSF / K, device="cuda"))
 
 
 def test_selection_set_equals_lite_routing_without_ties():
