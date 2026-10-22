@@ -55,6 +55,12 @@ def _run(proto, cfg, src, seq_lens, impl_cfg, *, pre_roll=False):
     bundle = proto.build_model(cfg, impl_cfg=impl_cfg)
     chunk = bundle.chunks[0]
     proto.load_hf_weights(chunk, src, cfg, bundle.parallel_state)
+    routing = {}
+    for i, layer in enumerate(chunk.layers):
+        if layer.moe is not None:
+            layer.moe.router.register_forward_hook(
+                lambda m, inp, out, i=i: routing.__setitem__(i, (out[0].detach().float().clone(), out[1].detach().clone()))
+            )
     torch.manual_seed(1234)
     total = sum(seq_lens)
     ids = torch.randint(0, cfg.vocab_size, (total,), device="cuda")
@@ -67,7 +73,8 @@ def _run(proto, cfg, src, seq_lens, impl_cfg, *, pre_roll=False):
     loss.backward()
     grads = {n: p.grad.detach().clone() for n, p in chunk.named_parameters() if p.grad is not None}
     logits = out.get("logits")
-    result = dict(loss=loss.detach().clone(), grads=grads, logits=None if logits is None else logits.detach().clone())
+    result = dict(loss=loss.detach().clone(), grads=grads, logits=None if logits is None else logits.detach().clone(),
+                  routing=routing)
     del bundle, chunk
     torch.cuda.empty_cache()
     return result
@@ -162,8 +169,9 @@ def test_rmsnorm_switch_runs_and_only_perturbs_by_norm_rounding(magi_cfg, magi_s
     print(f"\nrmsnorm switch: {n_sgl} norms swapped, loss rel diff vs lite {rel:.2e}", flush=True)
 
 
-def test_router_switch_runs_and_keeps_routing_close_to_lite(magi_cfg, magi_source, dist):
-    """align_modules=("rmsnorm", "router"): MoE routers run the SGLang path (bf16 gate GEMM default)."""
+def test_router_switch_matches_lite_routing_and_is_visible(magi_cfg, magi_source, dist):
+    """align_modules=("router",) alone: expert sets equal lite's on every MoE layer (fp32 gate, same inputs),
+    scores are the kernel's bytes, and the bf16 gate (SGLang default) is a visible change."""
     from megatron.lite.model.minimax_m3.align import protocol as A
     from megatron.lite.model.minimax_m3.lite import protocol as L
     from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
@@ -172,18 +180,29 @@ def test_router_switch_runs_and_keeps_routing_close_to_lite(magi_cfg, magi_sourc
     seq_lens = BATCHES["packed"]
     lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
     torch.manual_seed(7)
-    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("rmsnorm", "router")))
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("router",)))
     chunk = bundle.chunks[0]
     n_sgl = sum(isinstance(m, SglSigmoidTopKRouter) for m in chunk.modules())
     n_moe = sum(1 for layer in chunk.layers if layer.moe is not None)
     assert n_sgl == n_moe > 0, (n_sgl, n_moe)
     del bundle, chunk
     torch.cuda.empty_cache()
-    for gate in ("bf16", "fp32"):
-        align = _run(A, magi_cfg, magi_source, seq_lens,
-                     _impl_cfg(A, align_modules=("rmsnorm", "router"), align_router_gate=gate))
-        assert torch.isfinite(align["loss"]).all()
-        rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
-        assert rel < 1e-2, (gate, rel)
-        assert all(torch.isfinite(g).all() for g in align["grads"].values())
-        print(f"\nrouter switch (gate {gate}): {n_sgl} routers swapped, loss rel diff vs lite {rel:.2e}", flush=True)
+    fp32 = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router",), align_router_gate="fp32"))
+    bf16 = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router",), align_router_gate="bf16"))
+    for res in (fp32, bf16):
+        assert torch.isfinite(res["loss"]).all() and all(torch.isfinite(g).all() for g in res["grads"].values())
+    assert lite["routing"].keys() == fp32["routing"].keys() == bf16["routing"].keys()
+    for i in lite["routing"]:
+        (ls, li), (fs, fi), (bs, bi) = lite["routing"][i], fp32["routing"][i], bf16["routing"][i]
+        same = (li.sort(1).values == fi.sort(1).values).all(1).float().mean().item()
+        ws = torch.gather(fs, 1, fi.argsort(1)) - torch.gather(ls, 1, li.argsort(1))
+        print(f"\nlayer {i}: lite vs align(fp32 gate) same expert set {same:.4f} (first-layer inputs identical only "
+              f"for the first MoE layer), weight max |d| {ws.abs().max().item():.2e}; bf16 vs fp32 gate ids differ on "
+              f"{(bi.sort(1).values != fi.sort(1).values).any(1).float().mean().item():.4f} of rows", flush=True)
+        if i == min(lite["routing"]):
+            assert same > 0.999, same  # same inputs, same fp32 gate math up to GEMM rounding -> only near-ties may move
+    rel = ((lite["loss"] - fp32["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-2, rel
+    assert not torch.equal(lite["loss"], bf16["loss"]), "bf16 gate switch had no visible effect"
+    print(f"\nrouter switch: {n_sgl} routers swapped, loss rel diff vs lite fp32 gate {rel:.2e}, "
+          f"bf16 gate {((lite['loss'] - bf16['loss']).abs() / lite['loss'].abs()).item():.2e}", flush=True)

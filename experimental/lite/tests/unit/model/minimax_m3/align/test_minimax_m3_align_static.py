@@ -194,3 +194,16 @@ def test_router_swap_only_touches_moe_layers(monkeypatch):
     for owner in (moe_layer, dense_layer, model):
         M.ALIGN_SWAPS["router"](owner, SimpleNamespace(), None, router_gate="fp32")
     assert seen == [(moe_layer.moe.router, "fp32")]
+
+
+def test_swapped_attribute_names_exist_in_lite_source():
+    """The swaps resolve attributes by name with getattr defaults; pin the names against lite's source."""
+    import inspect
+
+    from megatron.lite.model.minimax_m3.lite import model as LM
+
+    layer_src = inspect.getsource(LM.MiniMaxM3Layer.__init__)
+    assert "self.mlp_norm" in layer_src and "self.moe" in layer_src
+    assert "self.norm" in inspect.getsource(LM.MiniMaxM3Model.__init__)
+    assert "self._final_norm(" in inspect.getsource(LM.MiniMaxM3Model.forward)
+    assert "self.router" in inspect.getsource(LM.M3MoELayer.__init__)

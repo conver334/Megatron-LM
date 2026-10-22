@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import torch
 import torch.nn as nn
 
 from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
@@ -21,7 +22,8 @@ Swap = Callable[..., None]  # (owner, config, ps, **align_opts)
 
 
 def _swap_rmsnorm(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
-    """Standalone norms (MoE ``mlp_norm``, final ``norm``) -> SGLang gemma_rmsnorm forward.
+    """MoE ``mlp_norm`` and the final ``norm`` hold their weight in ``SglGemmaRMSNorm``; the align forward feeds
+    them through SGLang's fused add+norm (``MiniMaxM3AlignLayer.forward`` / ``MiniMaxM3AlignModel._final_norm``).
     Norms fused into LayerNormLinear (attention input, dense MLP input) are not touched yet."""
     from megatron.lite.primitive.kernels.sgl_norm import SglGemmaRMSNorm
 
@@ -54,6 +56,28 @@ class MiniMaxM3AlignLayer(MiniMaxM3Layer):
         for name in align_modules:
             ALIGN_SWAPS[name](self, config, ps, **(align_opts or {}))
         self.align_modules = tuple(align_modules)
+        self._residual_pair = None
+
+    def forward(self, x: torch.Tensor, magi_ctx):
+        if "rmsnorm" not in self.align_modules:
+            return super().forward(x, magi_ctx)
+        from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm
+
+        if self.is_sparse_attention:
+            delta = self.attn(x, magi_ctx=magi_ctx)
+        else:
+            delta = self.attn(
+                x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
+            )
+        if self.moe is not None:
+            # SGLang post_attention_layernorm(attn_out, residual): norm of the fp32 sum, residual <- bf16 sum
+            normed, x = gemma_fused_add_rmsnorm(delta, x, self.mlp_norm.weight, self.mlp_norm.eps)
+            delta = self.moe(normed)
+        else:
+            x = x + delta
+            delta = self.mlp(x)
+        self._residual_pair = (delta, x)  # the final norm fuses this last add the same way
+        return x + delta
 
 
 class MiniMaxM3AlignModel(MiniMaxM3Model):
@@ -65,6 +89,17 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
         for name in align_modules:
             ALIGN_SWAPS[name](self, config, ps, **align_opts)
         self.align_modules = align_modules
+
+    def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
+        if "rmsnorm" not in self.align_modules:
+            return super()._final_norm(h)
+        from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm
+
+        last = self.layers[-1]
+        delta, residual = last._residual_pair  # SGLang model.norm(hidden, residual)
+        last._residual_pair = None
+        normed, _ = gemma_fused_add_rmsnorm(delta, residual, self.norm.weight, self.norm.eps)
+        return normed
 
 
 def _layer_factory(align_modules: tuple[str, ...], align_opts: dict | None = None):

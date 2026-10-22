@@ -40,8 +40,11 @@ def test_forward_bytes_follow_sglang_and_params_are_kept(gate):
     SglSigmoidTopKRouter.swap_in(r, gate=gate)
     assert dict(r.named_parameters()).keys() == names and torch.equal(r.gate.weight, w_before)
     assert r.gate.weight.dtype == torch.float32  # gate_fp32 master weight
+    hook_calls = []
+    r.gate.register_forward_pre_hook(lambda m, inp: hook_calls.append(1))  # the DDP param-gather hook sits here
     x = torch.randn(64, H, device="cuda", dtype=torch.bfloat16)
     scores, ids = r(x)
+    assert hook_calls == [1]
     if gate == "bf16":
         logits = torch.mm(x, r.gate.weight.to(torch.bfloat16).t(), out_dtype=torch.float32)
     else:
@@ -50,10 +53,11 @@ def test_forward_bytes_follow_sglang_and_params_are_kept(gate):
     assert torch.equal(ids, kid.long()) and torch.equal(scores.detach(), kw)
 
 
-def test_backward_matches_formula():
+@pytest.mark.parametrize("gate", ["bf16", "fp32"])
+def test_backward_matches_formula(gate):
     from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
 
-    r = SglSigmoidTopKRouter.swap_in(_router(), gate="bf16")
+    r = SglSigmoidTopKRouter.swap_in(_router(), gate=gate)
     x = torch.randn(64, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     scores, ids = r(x)
     g = torch.randn_like(scores)
@@ -64,12 +68,12 @@ def test_backward_matches_formula():
 
     xr = x.detach().float().requires_grad_(True)
     wr = r.gate.weight.detach().clone().requires_grad_(True)
-    logits = torch.mm(_ste_bf16(xr), _ste_bf16(wr).t())
+    logits = torch.mm(_ste_bf16(xr), (_ste_bf16(wr) if gate == "bf16" else wr).t())
     sel = torch.gather(torch.sigmoid(logits), 1, ids)
     probs = sel / sel.sum(1, keepdim=True) * 2.0
     probs.backward(g)
     torch.testing.assert_close(r.gate.weight.grad, wr.grad, rtol=1e-4, atol=1e-6)
-    torch.testing.assert_close(x.grad.float(), xr.grad, rtol=2e-2, atol=1e-4)
+    torch.testing.assert_close(x.grad.float(), xr.grad, rtol=5e-3, atol=1e-5)  # dX is bf16-rounded, else exact formula
 
 
 def test_lite_and_sgl_router_select_the_same_experts_on_real_shapes():
@@ -83,6 +87,63 @@ def test_lite_and_sgl_router_select_the_same_experts_on_real_shapes():
     same = (lite_ids.sort(1).values == sgl_ids.sort(1).values).all(1)
     ls = torch.gather(lite_scores, 1, lite_ids.argsort(1))
     ss = torch.gather(sgl_scores, 1, sgl_ids.argsort(1))
-    print(f"\nlite vs sgl router (fp32 gate): same expert set {same.float().mean().item():.4f}, "
-          f"score bitwise mismatches {(ls != ss).sum().item()}/{ls.numel()}, max abs {(ls - ss).abs().max().item():.2e}")
-    assert same.float().mean().item() > 0.99
+    # rows with a clear 4th-vs-5th biased-score gap must agree exactly; near-ties may legitimately differ
+    biased = torch.sigmoid(torch.mm(x.float(), r.gate.weight.float().t())) + r.expert_bias
+    top5 = biased.topk(5, dim=1).values
+    clear = (top5[:, 3] - top5[:, 4]) > 1e-5
+    print(f"\nlite vs sgl router (fp32 gate): same expert set {same.float().mean().item():.4f} "
+          f"({int(clear.sum())}/{x.size(0)} clear rows), score bitwise mismatches {(ls != ss).sum().item()}/{ls.numel()}, "
+          f"max abs {(ls - ss).abs().max().item():.2e}")
+    assert bool(same[clear].all())
+    torch.testing.assert_close(ss[same], ls[same], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("gate", ["bf16", "fp32"])
+def test_gate_gemm_is_batch_invariant_at_model_width(gate):
+    """The gate GEMM is the only non-vendored stage: its logits must not depend on how many rows share the launch."""
+    from megatron.lite.primitive.modules.router_sgl import _GateMM
+
+    torch.manual_seed(5)
+    w = (torch.randn(E, 6144, device="cuda") * 0.02).requires_grad_(False)
+    x = torch.randn(4096, 6144, device="cuda", dtype=torch.bfloat16)
+    dt = torch.bfloat16 if gate == "bf16" else torch.float32
+    full = _GateMM.apply(x, w, dt)
+    for n in (1, 8, 37, 512):
+        part = _GateMM.apply(x[:n], w, dt)
+        mism = (part != full[:n]).sum().item()
+        print(f"\ngate {gate}: rows {n} vs 4096 logits bitwise mismatches {mism}/{part.numel()}")
+        assert mism == 0, (n, mism)
+
+
+def test_fused_shared_expert_launch_gives_the_same_routed_bytes():
+    """SGLang (EP=1) launches moe_fused_gate with K=5 / K_ROUTED=4 (fused shared expert); align launches K=4."""
+    from megatron.lite.primitive.kernels.sgl_moe_fused_gate import moe_fused_gate
+
+    torch.manual_seed(6)
+    logits = torch.randn(4096, E, device="cuda")
+    bias = torch.randn(E, device="cuda") * 0.05
+    w4, i4 = moe_fused_gate(logits, bias, K, routed_scaling_factor=2.0, apply_routed_scaling_factor_on_output=True)
+    w5, i5 = moe_fused_gate(logits, bias, K + 1, num_fused_shared_experts=1, routed_scaling_factor=2.0,
+                            apply_routed_scaling_factor_on_output=True)
+    assert torch.equal(i4, i5[:, :K]) and torch.equal(w4, w5[:, :K])
+    assert torch.equal(i5[:, K], torch.full((4096,), E, dtype=torch.int32, device="cuda"))
+
+
+def test_replay_keeps_kernel_bytes_on_unchanged_rows():
+    from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
+
+    r = SglSigmoidTopKRouter.swap_in(_router(), gate="fp32")
+    x = torch.randn(32, H, device="cuda", dtype=torch.bfloat16)
+    scores0, ids0 = r(x)
+    override = ids0.clone()
+    override[0] = torch.tensor([0, 1, 2, 3], device="cuda")
+
+    class FakeReplay:  # RouterReplay.select_indices contract: returns a fresh tensor
+        def select_indices(self, native):
+            return override.clone()
+
+    r.router_replay = FakeReplay()
+    scores, ids = r(x)
+    assert torch.equal(ids, override)
+    assert torch.equal(scores[1:], scores0[1:])
+    assert not torch.equal(ids[0], ids0[0]) and torch.isfinite(scores[0]).all()

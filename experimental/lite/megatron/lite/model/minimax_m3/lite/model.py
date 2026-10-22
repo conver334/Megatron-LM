@@ -282,6 +282,10 @@ class MiniMaxM3Model(nn.Module):
             self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True)
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
+    def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
+        """Hook for sibling impls (``align`` fuses the last residual add into the norm)."""
+        return self.norm(h)
+
     def _reduce_loss(self, token_loss: torch.Tensor, loss_mask: torch.Tensor | None) -> torch.Tensor:
         """Mean over the supervised tokens of the whole sequence, also under context parallel.
 
@@ -341,7 +345,7 @@ class MiniMaxM3Model(nn.Module):
         output = {"hidden_states": h}
         if self.head is not None:
             assert self.norm is not None
-            hidden_for_head = self.norm(h)
+            hidden_for_head = self._final_norm(h)
             logits = self.head(hidden_for_head)
             if labels is not None:
                 t = _temperature_to_float(temperature)

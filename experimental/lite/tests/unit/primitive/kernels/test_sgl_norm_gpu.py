@@ -36,9 +36,10 @@ def test_forward_is_the_inference_kernel_bytes(shape):
     out = norm(x)
     want = kernel(x.reshape(-1, shape[-1]).contiguous(), norm.weight.data, 1e-6).reshape(shape)
     assert out.dtype == torch.bfloat16 and torch.equal(out, want)
-    # the kernel is not the torch fp32 rounding; record how far (information, not a gate)
-    ref = _ref(x, norm.weight, 1e-6).to(torch.bfloat16)
-    print(f"\nkernel vs torch-fp32 bf16 mismatches: {(out != ref).sum().item()}/{out.numel()}")
+    ref = _ref(x, norm.weight, 1e-6)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)  # it is a Gemma (1+w) RMSNorm with this eps
+    assert not torch.equal(out, kernel(x.reshape(-1, shape[-1]).contiguous(), norm.weight.data, 1e-1).reshape(shape))
+    print(f"\nkernel vs torch-fp32 bf16 mismatches: {(out != ref.to(torch.bfloat16)).sum().item()}/{out.numel()}")
 
 
 def test_backward_matches_fp32_reference_gradient():
@@ -74,6 +75,57 @@ def test_from_te_keeps_weight_name_and_values():
     x = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
     te_out, sgl_out = old(x), new(x)
     assert te_out.dtype == sgl_out.dtype == torch.bfloat16, (te_out.dtype, sgl_out.dtype)
+    torch.testing.assert_close(te_out.float(), sgl_out.float(), rtol=2e-2, atol=2e-2)
     diff = (te_out.float() - sgl_out.float()).abs()
     print(f"\nTE vs sgl gemma_rmsnorm: weight {old.weight.dtype}, bf16 mismatches {(te_out != sgl_out).sum().item()}/{x.numel()}, "
           f"max abs {diff.max().item():.3e}, max rel {(diff / te_out.float().abs().clamp_min(1e-6)).max().item():.3e}")
+
+
+def test_fused_add_is_the_inference_kernel_and_not_the_standalone_norm_of_the_bf16_sum():
+    from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm, gemma_fused_add_rmsnorm_kernel
+
+    kernel = _kernel()
+    try:
+        fused_kernel = gemma_fused_add_rmsnorm_kernel()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    torch.manual_seed(2)
+    a = torch.randn(256, 2048, device="cuda", dtype=torch.bfloat16)
+    r = torch.randn(256, 2048, device="cuda", dtype=torch.bfloat16) * 3
+    w = (torch.randn(2048, device="cuda") * 0.1).to(torch.bfloat16)
+    normed, res = gemma_fused_add_rmsnorm(a, r, w, 1e-6)
+    hid, want_res = a.clone(), r.clone()
+    fused_kernel(hid, want_res, w, 1e-6)
+    assert torch.equal(normed, hid) and torch.equal(res, want_res)
+    assert torch.equal(res, a + r)  # carried residual == torch bf16 add (one rounding of the fp32 sum)
+    torch.testing.assert_close(normed.float(), _ref(a.float() + r.float(), w, 1e-6), rtol=2e-2, atol=2e-2)
+    standalone = kernel(a + r, w, 1e-6)  # norm of the bf16-rounded sum: NOT what inference computes
+    n_diff = (standalone != normed).sum().item()
+    print(f"\nfused-add vs standalone-on-bf16-sum mismatches: {n_diff}/{normed.numel()}")
+    assert n_diff > 0
+
+
+def test_fused_add_backward_matches_fp32_reference():
+    from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm, gemma_fused_add_rmsnorm_kernel
+
+    try:
+        gemma_fused_add_rmsnorm_kernel()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    torch.manual_seed(3)
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    r = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.nn.Parameter((torch.randn(1024, device="cuda") * 0.1).to(torch.bfloat16))
+    g1 = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    g2 = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    normed, res = gemma_fused_add_rmsnorm(a, r, w, 1e-6)
+    (normed * g1).sum().backward(retain_graph=True)
+    (res * g2).sum().backward()
+
+    ar, rr, wr = (t.detach().float().requires_grad_(True) for t in (a, r, w))
+    y = ar + rr
+    (_ref(y, wr, 1e-6) * g1.float()).sum().backward(retain_graph=True)
+    (y * g2.float()).sum().backward()
+    for got, ref in ((a.grad, ar.grad), (r.grad, rr.grad)):
+        torch.testing.assert_close(got.float(), ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(w.grad.float(), wr.grad, rtol=2e-2, atol=2e-1)
