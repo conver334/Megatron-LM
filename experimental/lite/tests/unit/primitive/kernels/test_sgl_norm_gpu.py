@@ -65,7 +65,7 @@ def test_from_te_keeps_weight_name_and_values():
     from megatron.lite.primitive.kernels.sgl_norm import SglGemmaRMSNorm
 
     _kernel()
-    old = te.RMSNorm(512, eps=1e-6, zero_centered_gamma=True).cuda()
+    old = te.RMSNorm(512, eps=1e-6, zero_centered_gamma=True, params_dtype=torch.bfloat16).cuda()
     with torch.no_grad():
         old.weight.normal_(std=0.1)
     new = SglGemmaRMSNorm.from_te(old, eps=1e-6)
