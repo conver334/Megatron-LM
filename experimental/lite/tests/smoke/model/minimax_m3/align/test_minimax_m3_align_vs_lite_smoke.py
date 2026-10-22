@@ -109,3 +109,33 @@ def test_control_unrolled_labels_change_the_loss(magi_cfg, magi_source, dist):
     lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **L.MINIMAX_TRAINING_IMPL), pre_roll=True)
     align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=(), roll_labels=False))
     assert not torch.equal(lite["loss"], align["loss"])
+
+
+def test_rmsnorm_switch_runs_and_only_perturbs_by_norm_rounding(magi_cfg, magi_source, dist):
+    """align_modules=("rmsnorm",): standalone norms run the SGLang kernel; loss finite, close to lite,
+    and the swap is visible (planted change) on MoE layers and the final norm."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_norm import SglGemmaRMSNorm, gemma_rmsnorm_kernel
+
+    _magi_deps()
+    try:
+        gemma_rmsnorm_kernel()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **L.MINIMAX_TRAINING_IMPL), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("rmsnorm",)))
+    chunk = bundle.chunks[0]
+    n_sgl = sum(isinstance(m, SglGemmaRMSNorm) for m in chunk.modules())
+    n_moe = sum(1 for layer in chunk.layers if layer.moe is not None)
+    assert n_sgl == n_moe + 1, (n_sgl, n_moe)
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rmsnorm",)))
+    assert torch.isfinite(align["loss"]).all()
+    rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-2, rel
+    assert not torch.equal(lite["logits"], align["logits"]), "rmsnorm switch had no visible effect"
+    print(f"\nrmsnorm switch: {n_sgl} norms swapped, loss rel diff vs lite {rel:.2e}", flush=True)

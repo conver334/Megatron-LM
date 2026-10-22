@@ -16,10 +16,24 @@ from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
 from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Layer, MiniMaxM3Model
 from megatron.lite.primitive.parallel import ParallelState
 
-Swap = Callable[[MiniMaxM3Layer, MiniMaxM3Config, ParallelState], None]
+Swap = Callable[[nn.Module, MiniMaxM3Config, ParallelState], None]
 
-# name -> swap; keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
-ALIGN_SWAPS: dict[str, Swap] = {}
+
+
+def _swap_rmsnorm(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState) -> None:
+    """Standalone norms (MoE ``mlp_norm``, final ``norm``) -> SGLang gemma_rmsnorm forward.
+    Norms fused into LayerNormLinear (attention input, dense MLP input) are not touched yet."""
+    from megatron.lite.primitive.kernels.sgl_norm import SglGemmaRMSNorm
+
+    for name in ("mlp_norm", "norm"):
+        old = getattr(owner, name, None)
+        if old is not None:
+            setattr(owner, name, SglGemmaRMSNorm.from_te(old, eps=config.rms_norm_eps))
+
+
+# name -> swap, applied to every layer and then to the model (final norm / head live there);
+# keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
+ALIGN_SWAPS: dict[str, Swap] = {"rmsnorm": _swap_rmsnorm}
 
 
 class MiniMaxM3AlignLayer(MiniMaxM3Layer):
@@ -38,6 +52,9 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
         align_modules = tuple(getattr(train_config, "align_modules", ()))
         self.layer_cls = _layer_factory(align_modules)
         super().__init__(config, train_config, ps, vpp_chunk_id=vpp_chunk_id)
+        for name in align_modules:
+            ALIGN_SWAPS[name](self, config, ps)
+        self.align_modules = align_modules
 
 
 def _layer_factory(align_modules: tuple[str, ...]):

@@ -138,3 +138,36 @@ def test_align_forward_step_rolls_only_when_enabled(monkeypatch):
     model.align_roll_labels = False
     A._forward_step(model, batch)
     assert seen["labels"] == [1, 2, 3]
+
+
+def test_rmsnorm_swap_replaces_standalone_norms_only(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    class FakeNorm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.full((8,), 0.5))
+
+    swapped = []
+    fake = ModuleType("megatron.lite.primitive.kernels.sgl_norm")
+
+    class SglGemmaRMSNorm(torch.nn.Module):
+        @classmethod
+        def from_te(cls, module, eps):
+            swapped.append((module, eps))
+            return cls()
+
+    fake.SglGemmaRMSNorm = SglGemmaRMSNorm
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    moe_layer = torch.nn.Module()
+    moe_layer.mlp_norm = FakeNorm()
+    dense_layer = torch.nn.Module()
+    dense_layer.mlp_norm = None
+    model = torch.nn.Module()
+    model.norm = FakeNorm()
+    cfg = SimpleNamespace(rms_norm_eps=1e-6)
+    for owner in (moe_layer, dense_layer, model):
+        M.ALIGN_SWAPS["rmsnorm"](owner, cfg, None)
+    assert [eps for _, eps in swapped] == [1e-6, 1e-6]
+    assert isinstance(moe_layer.mlp_norm, SglGemmaRMSNorm) and dense_layer.mlp_norm is None
+    assert isinstance(model.norm, SglGemmaRMSNorm)
