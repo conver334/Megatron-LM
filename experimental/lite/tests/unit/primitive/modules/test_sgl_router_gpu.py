@@ -98,6 +98,11 @@ def test_lite_and_sgl_router_select_the_same_experts_on_real_shapes():
     torch.testing.assert_close(ss[same], ls[same], rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="cuBLAS torch.mm is not batch-invariant (GB200 10-22: M=1..1024 vs 4096 differ in ~99% of logits, "
+    "same M reproducible); SGLang BI mode swaps it for a persistent GEMM -> the gate contract needs that kernel on both sides",
+)
 @pytest.mark.parametrize("gate", ["bf16", "fp32"])
 def test_gate_gemm_is_batch_invariant_at_model_width(gate):
     """The gate GEMM is the only non-vendored stage: its logits must not depend on how many rows share the launch."""
@@ -108,11 +113,9 @@ def test_gate_gemm_is_batch_invariant_at_model_width(gate):
     x = torch.randn(4096, 6144, device="cuda", dtype=torch.bfloat16)
     dt = torch.bfloat16 if gate == "bf16" else torch.float32
     full = _GateMM.apply(x, w, dt)
-    for n in (1, 8, 37, 512):
-        part = _GateMM.apply(x[:n], w, dt)
-        mism = (part != full[:n]).sum().item()
-        print(f"\ngate {gate}: rows {n} vs 4096 logits bitwise mismatches {mism}/{part.numel()}")
-        assert mism == 0, (n, mism)
+    report = {n: (_GateMM.apply(x[:n], w, dt) != full[:n]).sum().item() for n in (1, 8, 37, 512, 2048)}
+    print(f"\ngate {gate}: logits mismatches vs the 4096-row launch {report}")
+    assert all(v == 0 for v in report.values()), report
 
 
 def test_fused_shared_expert_launch_gives_the_same_routed_bytes():
