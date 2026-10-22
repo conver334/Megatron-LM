@@ -14,10 +14,14 @@ WEIGHT_SPLIT_SCALE = 1.0 / 256.0  # SGLang dsv4/gemm.py _HPC_GEMM_WEIGHT_SCALE
 
 
 def deep_gemm_module():
+    """sgl-deep-gemm with deterministic algorithms on: the default routes small-M shapes to cuBLASLt, which is not
+    batch-invariant (GB200 10-22: M=1..512 vs 4096 differ); with the flag every call form is bitwise M-invariant."""
     try:
         import deep_gemm
     except ImportError as exc:
         raise ImportError("align deepgemm GEMMs need the sgl-deep-gemm package (import deep_gemm)") from exc
+    if not deep_gemm.get_deterministic_algorithms():
+        deep_gemm.use_deterministic_algorithms(True)
     return deep_gemm
 
 

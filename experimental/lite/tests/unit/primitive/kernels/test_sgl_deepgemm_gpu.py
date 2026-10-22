@@ -29,7 +29,7 @@ def test_split_gemm_matches_fp64_reference_of_the_split_weight():
     x = torch.randn(512, H, device="cuda", dtype=torch.bfloat16)
     out = bf16xfp32_gemm(x, w)
     ref = x.double() @ effective_weight(w).double().t()
-    torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-4)  # fp32 accumulation of ~6k terms
     exact = x.double() @ w.double().t()
     print(f"\nsplit weight vs exact fp32 weight: max |d| {(ref - exact).abs().max().item():.2e} "
           f"(relative to max |logit| {exact.abs().max().item():.2e}); vs cuBLAS fp32 torch.mm: "
