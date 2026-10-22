@@ -75,6 +75,8 @@ def test_backward_matches_formula(gate):
     _needs_deepgemm(gate)
     r = SglSigmoidTopKRouter.swap_in(_router(), gate=gate)
     x = torch.randn(64, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    logits_seen = []
+    r.gate.register_forward_hook(lambda m, inp, out: logits_seen.append(out.detach()))
     scores, ids = r(x)
     g = torch.randn_like(scores)
     scores.backward(g)
@@ -91,6 +93,7 @@ def test_backward_matches_formula(gate):
     else:
         w_fwd = _ste_bf16(wr) if gate == "bf16" else wr
     logits = torch.mm(_ste_bf16(xr), w_fwd.t())
+    logits = logits + (logits_seen[0] - logits.detach())  # the module's own logit values, formula gradient
     sel = torch.gather(torch.sigmoid(logits), 1, ids)
     probs = sel / sel.sum(1, keepdim=True) * 2.0
     probs.backward(g)
