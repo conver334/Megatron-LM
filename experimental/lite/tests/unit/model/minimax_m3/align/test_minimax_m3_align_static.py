@@ -37,7 +37,7 @@ def test_align_impl_config_is_lite_plus_align_modules_with_training_recipe_defau
 
     lite_names = {f.name for f in fields(L.ImplConfig)}
     align_names = {f.name for f in fields(A.ImplConfig)}
-    assert align_names - lite_names == {"align_modules", "roll_labels"}
+    assert align_names - lite_names == {"align_modules", "align_router_gate", "roll_labels"}
     cfg = A.ImplConfig()
     assert cfg.align_modules == ()
     for k, v in L.MINIMAX_TRAINING_IMPL.items():
@@ -62,10 +62,11 @@ def test_align_swaps_are_applied_in_order(monkeypatch):
 
     calls = []
     monkeypatch.setattr(M.MiniMaxM3Layer, "__init__", lambda self, *a, **k: torch.nn.Module.__init__(self))
-    monkeypatch.setitem(M.ALIGN_SWAPS, "a", lambda layer, cfg, ps: calls.append("a"))
-    monkeypatch.setitem(M.ALIGN_SWAPS, "b", lambda layer, cfg, ps: calls.append("b"))
-    layer = M._layer_factory(("b", "a"))(SimpleNamespace(), SimpleNamespace(), 0)
-    assert calls == ["b", "a"] and layer.align_modules == ("b", "a")
+    monkeypatch.setitem(M.ALIGN_SWAPS, "a", lambda layer, cfg, ps, **o: calls.append(("a", o)))
+    monkeypatch.setitem(M.ALIGN_SWAPS, "b", lambda layer, cfg, ps, **o: calls.append(("b", o)))
+    layer = M._layer_factory(("b", "a"), {"router_gate": "fp32"})(SimpleNamespace(), SimpleNamespace(), 0)
+    assert calls == [("b", {"router_gate": "fp32"}), ("a", {"router_gate": "fp32"})]
+    assert layer.align_modules == ("b", "a")
 
 
 def test_align_build_model_forwards_lite_cfg_and_align_modules(monkeypatch):
@@ -100,7 +101,7 @@ def test_align_build_model_forwards_lite_cfg_and_align_modules(monkeypatch):
     assert bundle.forward_step is A._forward_step
     assert bundle.chunks[0].align_roll_labels is True
     tc = seen["train_cfg"]
-    assert tc.align_modules == ("rmsnorm",)
+    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "bf16"}
     assert tc.rope_fusion is True and tc.msa_index_input_norm == "fused" and tc.moe_permute_fusion is False
     assert bundle.chunks[0].magi_settings.dense_kernel_backend == "fa4_varlen"
 
@@ -171,3 +172,25 @@ def test_rmsnorm_swap_replaces_standalone_norms_only(monkeypatch):
     assert [eps for _, eps in swapped] == [1e-6, 1e-6]
     assert isinstance(moe_layer.mlp_norm, SglGemmaRMSNorm) and dense_layer.mlp_norm is None
     assert isinstance(model.norm, SglGemmaRMSNorm)
+
+
+def test_router_swap_only_touches_moe_layers(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.primitive.modules.router_sgl")
+
+    class SglSigmoidTopKRouter:
+        @classmethod
+        def swap_in(cls, router, *, gate):
+            seen.append((router, gate))
+            return router
+
+    fake.SglSigmoidTopKRouter = SglSigmoidTopKRouter
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    moe_layer = SimpleNamespace(moe=SimpleNamespace(router=object()))
+    dense_layer = SimpleNamespace(moe=None)
+    model = SimpleNamespace()
+    for owner in (moe_layer, dense_layer, model):
+        M.ALIGN_SWAPS["router"](owner, SimpleNamespace(), None, router_gate="fp32")
+    assert seen == [(moe_layer.moe.router, "fp32")]

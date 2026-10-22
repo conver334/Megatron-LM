@@ -139,3 +139,30 @@ def test_rmsnorm_switch_runs_and_only_perturbs_by_norm_rounding(magi_cfg, magi_s
     assert rel < 1e-2, rel
     assert not torch.equal(lite["loss"], align["loss"]), "rmsnorm switch had no visible effect"
     print(f"\nrmsnorm switch: {n_sgl} norms swapped, loss rel diff vs lite {rel:.2e}", flush=True)
+
+
+def test_router_switch_runs_and_keeps_routing_close_to_lite(magi_cfg, magi_source, dist):
+    """align_modules=("rmsnorm", "router"): MoE routers run the SGLang path (bf16 gate GEMM default)."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
+
+    _magi_deps()
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **L.MINIMAX_TRAINING_IMPL), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("rmsnorm", "router")))
+    chunk = bundle.chunks[0]
+    n_sgl = sum(isinstance(m, SglSigmoidTopKRouter) for m in chunk.modules())
+    n_moe = sum(1 for layer in chunk.layers if layer.moe is not None)
+    assert n_sgl == n_moe > 0, (n_sgl, n_moe)
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    for gate in ("bf16", "fp32"):
+        align = _run(A, magi_cfg, magi_source, seq_lens,
+                     _impl_cfg(A, align_modules=("rmsnorm", "router"), align_router_gate=gate))
+        assert torch.isfinite(align["loss"]).all()
+        rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
+        assert rel < 1e-2, (gate, rel)
+        assert all(torch.isfinite(g).all() for g in align["grads"].values())
+        print(f"\nrouter switch (gate {gate}): {n_sgl} routers swapped, loss rel diff vs lite {rel:.2e}", flush=True)

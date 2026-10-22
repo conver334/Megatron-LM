@@ -54,6 +54,8 @@ class ImplConfig(_lite.ImplConfig):
     moe_permute_fusion: bool = MINIMAX_TRAINING_IMPL["moe_permute_fusion"]
     # modules whose forward calls the SGLang kernel; () == lite numerics (see align/model.py ALIGN_SWAPS)
     align_modules: tuple[str, ...] = ()
+    # router gate GEMM as in SGLang: "bf16" = SGLANG_OPT_USE_BF16_ROUTER_GEMM=1 (default), "fp32" = env off
+    align_router_gate: str = "bf16"
     # PackedBatch contract (verl_mlite, other protocols): labels/loss_mask arrive unrolled and the protocol rolls
     # them left per document (last token masked). lite does not roll; keep False only for lite-style batches.
     roll_labels: bool = True
@@ -101,7 +103,10 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         model_cfg,
         impl_cfg=to_lite_impl_cfg(impl_cfg),
         model_cls=MiniMaxM3AlignModel,
-        extra_train_cfg={"align_modules": tuple(impl_cfg.align_modules)},
+        extra_train_cfg={
+            "align_modules": tuple(impl_cfg.align_modules),
+            "align_opts": {"router_gate": impl_cfg.align_router_gate},
+        },
     )
     for chunk in bundle.chunks:
         chunk.align_roll_labels = impl_cfg.roll_labels
