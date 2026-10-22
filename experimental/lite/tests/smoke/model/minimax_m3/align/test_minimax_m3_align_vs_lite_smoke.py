@@ -97,14 +97,17 @@ def test_align_without_switches_matches_lite_bitwise(magi_cfg, magi_source, dist
     noise = {n: _rel(lite["grads"][n], lite2["grads"][n]) for n in lite["grads"]}
     diff = {n: _rel(lite["grads"][n], align["grads"][n]) for n in lite["grads"]}
     if _deterministic_supported():
-        # only the dense fa4 backward is non-reproducible (atomics): every grad that is bitwise in lite A/A must be
-        # bitwise in align; the rest (dense-layer params, embedding) stay inside 2x the A/A spread
-        stable = [n for n, v in noise.items() if v == 0.0]
+        # only the dense fa4 backward is non-reproducible (atomics). Noise is judged per module group (layers.N / embed /
+        # norm / head): a group is stable when all its grads are bitwise in lite A/A (a single param can be equal by
+        # chance); stable groups must be bitwise in align, the rest stay inside 2x the A/A spread
+        group = lambda n: ".".join(n.split(".")[:2]) if n.startswith("layers.") else n.split(".")[0]
+        unstable_groups = {group(n) for n, v in noise.items() if v > 0.0}
+        stable = [n for n in noise if group(n) not in unstable_groups]
         assert stable, "no reproducible grads under Magi deterministic mode"
         bad = [n for n in stable if diff[n] != 0.0]
         assert bad == [], bad[:10]
         bound = 2 * max(noise.values())
-        mode = f"deterministic, {len(stable)} stable grads bitwise"
+        mode = f"deterministic, {len(stable)} grads in stable groups bitwise, noisy groups {sorted(unstable_groups)}"
     else:
         # MSAV1 backward itself is non-reproducible: lite-vs-align relative spread must sit inside the lite A/A spread
         bound = 2 * max(noise.values())
