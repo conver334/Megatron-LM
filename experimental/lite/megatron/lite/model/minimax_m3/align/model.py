@@ -33,7 +33,7 @@ def _swap_rmsnorm(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, 
             setattr(owner, name, SglGemmaRMSNorm.from_te(old, eps=config.rms_norm_eps))
 
 
-def _swap_router(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *, router_gate: str = "bf16", **_opts) -> None:
+def _swap_router(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *, router_gate: str = "fp32", **_opts) -> None:
     """MoE router -> SGLang gate GEMM dtype + moe_fused_gate selection (slot order, lowest-id ties)."""
     from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
 

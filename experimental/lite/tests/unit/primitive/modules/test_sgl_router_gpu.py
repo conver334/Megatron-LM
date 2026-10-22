@@ -29,11 +29,22 @@ def _router():
     return r
 
 
-@pytest.mark.parametrize("gate", ["bf16", "fp32"])
+def _needs_deepgemm(gate):
+    if gate == "fp32_deepgemm":
+        from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+
+        try:
+            deep_gemm_module()
+        except ImportError as exc:
+            pytest.skip(str(exc))
+
+
+@pytest.mark.parametrize("gate", ["bf16", "fp32", "fp32_deepgemm"])
 def test_forward_bytes_follow_sglang_and_params_are_kept(gate):
     from megatron.lite.primitive.kernels.sgl_moe_fused_gate import moe_fused_gate
     from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
 
+    _needs_deepgemm(gate)
     r = _router()
     names = dict(r.named_parameters()).keys()
     w_before = r.gate.weight.detach().clone()
@@ -47,16 +58,21 @@ def test_forward_bytes_follow_sglang_and_params_are_kept(gate):
     assert hook_calls == [1]
     if gate == "bf16":
         logits = torch.mm(x, r.gate.weight.to(torch.bfloat16).t(), out_dtype=torch.float32)
-    else:
+    elif gate == "fp32":
         logits = torch.mm(x.float(), r.gate.weight.float().t())
+    else:
+        from megatron.lite.primitive.kernels.sgl_deepgemm import bf16xfp32_gemm
+
+        logits = bf16xfp32_gemm(x, r.gate.weight)
     kw, kid = moe_fused_gate(logits, r.expert_bias, K, routed_scaling_factor=2.0, apply_routed_scaling_factor_on_output=True)
     assert torch.equal(ids, kid.long()) and torch.equal(scores.detach(), kw)
 
 
-@pytest.mark.parametrize("gate", ["bf16", "fp32"])
+@pytest.mark.parametrize("gate", ["bf16", "fp32", "fp32_deepgemm"])
 def test_backward_matches_formula(gate):
     from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
 
+    _needs_deepgemm(gate)
     r = SglSigmoidTopKRouter.swap_in(_router(), gate=gate)
     x = torch.randn(64, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     scores, ids = r(x)
@@ -68,7 +84,13 @@ def test_backward_matches_formula(gate):
 
     xr = x.detach().float().requires_grad_(True)
     wr = r.gate.weight.detach().clone().requires_grad_(True)
-    logits = torch.mm(_ste_bf16(xr), (_ste_bf16(wr) if gate == "bf16" else wr).t())
+    if gate == "fp32_deepgemm":  # forward operand is the bf16 high/low split of W
+        from megatron.lite.primitive.kernels.sgl_deepgemm import effective_weight
+
+        w_fwd = wr + (effective_weight(wr) - wr.detach())
+    else:
+        w_fwd = _ste_bf16(wr) if gate == "bf16" else wr
+    logits = torch.mm(_ste_bf16(xr), w_fwd.t())
     sel = torch.gather(torch.sigmoid(logits), 1, ids)
     probs = sel / sel.sum(1, keepdim=True) * 2.0
     probs.backward(g)
@@ -98,22 +120,26 @@ def test_lite_and_sgl_router_select_the_same_experts_on_real_shapes():
     torch.testing.assert_close(ss[same], ls[same], rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.xfail(
+_CUBLAS_NOT_BI = pytest.mark.xfail(
     strict=True,
     reason="cuBLAS torch.mm is not batch-invariant (GB200 10-22: M=1..1024 vs 4096 differ in ~99% of logits, "
-    "same M reproducible); SGLang BI mode swaps it for a persistent GEMM -> the gate contract needs that kernel on both sides",
+    "same M reproducible); the contract mode is fp32_deepgemm",
 )
-@pytest.mark.parametrize("gate", ["bf16", "fp32"])
+
+
+@pytest.mark.parametrize(
+    "gate", [pytest.param("bf16", marks=_CUBLAS_NOT_BI), pytest.param("fp32", marks=_CUBLAS_NOT_BI), "fp32_deepgemm"]
+)
 def test_gate_gemm_is_batch_invariant_at_model_width(gate):
     """The gate GEMM is the only non-vendored stage: its logits must not depend on how many rows share the launch."""
     from megatron.lite.primitive.modules.router_sgl import _GateMM
 
+    _needs_deepgemm(gate)
     torch.manual_seed(5)
     w = (torch.randn(E, 6144, device="cuda") * 0.02).requires_grad_(False)
     x = torch.randn(4096, 6144, device="cuda", dtype=torch.bfloat16)
-    dt = torch.bfloat16 if gate == "bf16" else torch.float32
-    full = _GateMM.apply(x, w, dt)
-    report = {n: (_GateMM.apply(x[:n], w, dt) != full[:n]).sum().item() for n in (1, 8, 37, 512, 2048)}
+    full = _GateMM.apply(x, w, gate)
+    report = {n: (_GateMM.apply(x[:n], w, gate) != full[:n]).sum().item() for n in (1, 8, 37, 512, 2048)}
     print(f"\ngate {gate}: logits mismatches vs the 4096-row launch {report}")
     assert all(v == 0 for v in report.values()), report
 

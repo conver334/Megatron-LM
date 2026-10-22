@@ -13,50 +13,68 @@ from megatron.lite.primitive.modules.router import SigmoidTopKRouter, _GatingLin
 from megatron.lite.primitive.modules.router_replay import gather_replayed_router_scores
 
 
+GATE_MODES = ("bf16", "fp32", "fp32_deepgemm")
+
+
 class _GateMM(torch.autograd.Function):
-    """SGLang ``_compute_router_logits`` without batch-invariant mode (cuBLAS):
-    bf16: ``torch.mm(x, W.bf16.T, out_dtype=fp32)`` (SGLANG_OPT_USE_BF16_ROUTER_GEMM=1, default);
-    fp32: ``torch.mm(x.float(), W.float().T)`` (env off). Under --enable-deterministic-inference SGLang
-    replaces both with batch-invariant GEMMs (bf16-rounded logits for bf16 gate); not reproduced here yet.
-    dX uses the operand the forward used (bf16(W) in bf16 mode), like RouterGatingLinearFunction."""
+    """SGLang ``_compute_router_logits`` -> fp32 logits.
+    bf16: ``torch.mm(x, W.bf16.T, out_dtype=fp32)`` (SGLANG_OPT_USE_BF16_ROUTER_GEMM=1, cuBLAS, not batch-invariant);
+    fp32: ``torch.mm(x.float(), W.float().T)`` (env off, algo cublas; not batch-invariant);
+    fp32_deepgemm: env off + SGLANG_OPT_BF16_FP32_GEMM_ALGO=deep_gemm -> bf16 high/low split of the fp32 weight through
+    DeepGEMM with fp32 output (batch-invariant; the C1 contract). dX uses the operand the forward used."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, gate_dtype: torch.dtype) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, mode: str) -> torch.Tensor:
         ctx.save_for_backward(x, weight)
-        ctx.gate_dtype = gate_dtype
-        if gate_dtype == torch.bfloat16:
+        ctx.mode = mode
+        if mode == "bf16":
             return torch.mm(x.to(torch.bfloat16), weight.to(torch.bfloat16).t(), out_dtype=torch.float32)
-        return torch.mm(x.float(), weight.float().t())
+        if mode == "fp32":
+            return torch.mm(x.float(), weight.float().t())
+        if mode == "fp32_deepgemm":
+            from megatron.lite.primitive.kernels.sgl_deepgemm import bf16xfp32_gemm
+
+            return bf16xfp32_gemm(x.to(torch.bfloat16), weight)
+        raise ValueError(f"align router gate mode {mode!r}; known: {GATE_MODES}")
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         x, weight = ctx.saved_tensors
         g = grad.float()
-        dx = torch.mm(g, weight.to(ctx.gate_dtype).float()).to(x.dtype)
-        return dx, torch.mm(g.t(), x.float()).to(weight.dtype), None
+        if ctx.mode == "bf16":
+            w_used = weight.to(torch.bfloat16).float()
+        elif ctx.mode == "fp32_deepgemm":
+            from megatron.lite.primitive.kernels.sgl_deepgemm import effective_weight
+
+            w_used = effective_weight(weight)
+        else:
+            w_used = weight.float()
+        return torch.mm(g, w_used).to(x.dtype), torch.mm(g.t(), x.float()).to(weight.dtype), None
 
 
 class _SglGatingLinear(_GatingLinear):
     """Owns ``gate.weight``: the GEMM must run inside this module's forward so the DDP param-gather pre-hook fires."""
 
-    def forward(self, x: torch.Tensor, gate_dtype: torch.dtype) -> torch.Tensor:  # type: ignore[override]
-        return _GateMM.apply(x, self.weight, gate_dtype)
+    def forward(self, x: torch.Tensor, mode: str) -> torch.Tensor:  # type: ignore[override]
+        return _GateMM.apply(x, self.weight, mode)
 
 
 class SglSigmoidTopKRouter(SigmoidTopKRouter):
-    align_gate_dtype: torch.dtype = torch.bfloat16
+    align_gate_mode: str = "fp32"
 
     @classmethod
-    def swap_in(cls, router: SigmoidTopKRouter, *, gate: str = "bf16") -> "SglSigmoidTopKRouter":
+    def swap_in(cls, router: SigmoidTopKRouter, *, gate: str = "fp32") -> "SglSigmoidTopKRouter":
         if router.score_function != "sigmoid" or router.num_groups is not None:
             raise NotImplementedError("align router: sigmoid, ungrouped routing only")
+        if gate not in GATE_MODES:
+            raise ValueError(f"align router gate {gate!r}; known: {GATE_MODES}")
         router.__class__ = cls
         router.gate.__class__ = _SglGatingLinear
-        router.align_gate_dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[gate]
+        router.align_gate_mode = gate
         return router
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.gate(x.reshape(-1, x.size(-1)), self.align_gate_dtype)
+        logits = self.gate(x.reshape(-1, x.size(-1)), self.align_gate_mode)
         weights_k, ids_k = moe_fused_gate(
             logits.detach(),
             self.expert_bias,

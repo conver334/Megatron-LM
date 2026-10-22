@@ -101,7 +101,7 @@ def test_align_build_model_forwards_lite_cfg_and_align_modules(monkeypatch):
     assert bundle.forward_step is A._forward_step
     assert bundle.chunks[0].align_roll_labels is True
     tc = seen["train_cfg"]
-    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "bf16"}
+    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "fp32"}
     assert tc.rope_fusion is True and tc.msa_index_input_norm == "fused" and tc.moe_permute_fusion is False
     assert bundle.chunks[0].magi_settings.dense_kernel_backend == "fa4_varlen"
 

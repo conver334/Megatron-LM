@@ -54,9 +54,10 @@ class ImplConfig(_lite.ImplConfig):
     moe_permute_fusion: bool = MINIMAX_TRAINING_IMPL["moe_permute_fusion"]
     # modules whose forward calls the SGLang kernel; () == lite numerics (see align/model.py ALIGN_SWAPS)
     align_modules: tuple[str, ...] = ()
-    # router gate GEMM as in SGLang without batch-invariant mode: "bf16" = SGLANG_OPT_USE_BF16_ROUTER_GEMM=1
-    # (default), "fp32" = env off. SGLang's --enable-deterministic-inference GEMM override is not reproduced yet.
-    align_router_gate: str = "bf16"
+    # router gate GEMM as in SGLang (C1 decision 10-22: inference runs SGLANG_OPT_USE_BF16_ROUTER_GEMM=0, fp32 gate):
+    # "fp32" = cuBLAS torch.mm (BI=0 baseline); "fp32_deepgemm" = SGLANG_OPT_BF16_FP32_GEMM_ALGO=deep_gemm, the
+    # batch-invariant contract (bf16 high/low split through DeepGEMM); "bf16" = the SGLang default we do not use.
+    align_router_gate: str = "fp32"
     # PackedBatch contract (verl_mlite, other protocols): labels/loss_mask arrive unrolled and the protocol rolls
     # them left per document (last token masked). lite does not roll; keep False only for lite-style batches.
     roll_labels: bool = True
