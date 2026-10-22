@@ -73,4 +73,7 @@ def test_from_te_keeps_weight_name_and_values():
     assert torch.equal(new.weight, old.weight) and new.weight.dtype == old.weight.dtype
     x = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
     te_out, sgl_out = old(x), new(x)
-    print(f"\nTE vs sgl gemma_rmsnorm bf16 mismatches: {(te_out != sgl_out).sum().item()}/{x.numel()}")
+    assert te_out.dtype == sgl_out.dtype == torch.bfloat16, (te_out.dtype, sgl_out.dtype)
+    diff = (te_out.float() - sgl_out.float()).abs()
+    print(f"\nTE vs sgl gemma_rmsnorm: weight {old.weight.dtype}, bf16 mismatches {(te_out != sgl_out).sum().item()}/{x.numel()}, "
+          f"max abs {diff.max().item():.3e}, max rel {(diff / te_out.float().abs().clamp_min(1e-6)).max().item():.3e}")

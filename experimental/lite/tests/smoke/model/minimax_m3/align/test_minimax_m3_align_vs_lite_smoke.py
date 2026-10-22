@@ -137,5 +137,5 @@ def test_rmsnorm_switch_runs_and_only_perturbs_by_norm_rounding(magi_cfg, magi_s
     assert torch.isfinite(align["loss"]).all()
     rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
     assert rel < 1e-2, rel
-    assert not torch.equal(lite["logits"], align["logits"]), "rmsnorm switch had no visible effect"
+    assert not torch.equal(lite["loss"], align["loss"]), "rmsnorm switch had no visible effect"
     print(f"\nrmsnorm switch: {n_sgl} norms swapped, loss rel diff vs lite {rel:.2e}", flush=True)
