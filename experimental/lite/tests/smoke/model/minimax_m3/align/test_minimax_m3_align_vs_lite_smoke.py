@@ -90,23 +90,31 @@ def test_align_without_switches_matches_lite_bitwise(magi_cfg, magi_source, dist
         assert torch.equal(lite["logits"], lite2["logits"])
         assert torch.equal(lite["logits"], align["logits"])
     assert lite["grads"].keys() == align["grads"].keys()
-    if _deterministic_supported():
-        bad = [n for n in lite["grads"] if not torch.equal(lite["grads"][n], align["grads"][n])]
-        assert bad == [], bad[:10]
-        return
-    # non-deterministic backward: lite-vs-align relative spread must sit inside the lite A/A relative spread
+
     def _rel(a, b):
         return ((a.float() - b.float()).abs().max() / a.float().abs().max().clamp_min(1e-30)).item()
 
     noise = {n: _rel(lite["grads"][n], lite2["grads"][n]) for n in lite["grads"]}
     diff = {n: _rel(lite["grads"][n], align["grads"][n]) for n in lite["grads"]}
-    bound = 2 * max(noise.values())
-    assert bound > 0, "lite A/A grads all bitwise but Magi reports no deterministic mode; revisit the criterion"
+    if _deterministic_supported():
+        # only the dense fa4 backward is non-reproducible (atomics): every grad that is bitwise in lite A/A must be
+        # bitwise in align; the rest (dense-layer params, embedding) stay inside 2x the A/A spread
+        stable = [n for n, v in noise.items() if v == 0.0]
+        assert stable, "no reproducible grads under Magi deterministic mode"
+        bad = [n for n in stable if diff[n] != 0.0]
+        assert bad == [], bad[:10]
+        bound = 2 * max(noise.values())
+        mode = f"deterministic, {len(stable)} stable grads bitwise"
+    else:
+        # MSAV1 backward itself is non-reproducible: lite-vs-align relative spread must sit inside the lite A/A spread
+        bound = 2 * max(noise.values())
+        assert bound > 0, "lite A/A grads all bitwise but Magi reports no deterministic mode; revisit the criterion"
+        mode = "Magi deterministic unsupported"
     over = {n: (diff[n], noise[n]) for n in diff if diff[n] > bound}
     assert over == {}, (bound, dict(list(over.items())[:10]))
     bitwise = sum(1 for n in diff if diff[n] == 0.0)
     print(f"\n{tag}: forward bitwise; grads {bitwise}/{len(diff)} bitwise, max rel diff {max(diff.values()):.2e} "
-          f"vs A/A bound {bound:.2e} (Magi deterministic unsupported, dense {_dense_backend()})", flush=True)
+          f"vs A/A bound {bound:.2e} ({mode}, dense {_dense_backend()})", flush=True)
 
 
 def test_control_unrolled_labels_change_the_loss(magi_cfg, magi_source, dist):
