@@ -197,3 +197,15 @@ def test_fork_router_path_equals_mlite_router_module(monkeypatch):
         wf, idf = fork_gate(fork_linear(x, w), bias, K, renormalize=True, routed_scaling_factor=RSF, apply_routed_scaling_factor_on_output=True)
         assert torch.equal(ids, idf.long()) and torch.equal(scores.detach(), wf), m
     print(f"\nrouter module vs fork path ({src} gate): bitwise for M in {ROWS}", flush=True)
+
+
+def test_crossstack_comparison_detects_a_planted_split_mismatch(monkeypatch):
+    """Planted error: a different high/low split scale on the mlite side must break byte equality."""
+    from megatron.lite.primitive.kernels import sgl_deepgemm
+
+    fork_linear, _, _ = _fork()
+    w, bias, _ = _gate_params(3)
+    torch.manual_seed(11)
+    x = torch.randn(512, H, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(sgl_deepgemm, "WEIGHT_SPLIT_SCALE", 1.0 / 128.0)
+    assert not torch.equal(fork_linear(x, w), sgl_deepgemm.bf16xfp32_gemm(x, w))
