@@ -30,9 +30,19 @@ def _deterministic_supported() -> bool:
     return True
 
 
+def _dense_backend() -> str:
+    """MINIMAX_TRAINING_IMPL uses fa4_varlen (pip flash_attn.cute); fall back to Magi's fa4 where it is absent (OCI venv)."""
+    try:
+        import flash_attn.cute  # noqa: F401
+    except ImportError:
+        return "fa4"
+    return "fa4_varlen"
+
+
 def _impl_cfg(proto, **kw):
     from megatron.lite.runtime.contracts import ParallelConfig
 
+    kw.setdefault("magi_dense_kernel_backend", _dense_backend())
     return proto.ImplConfig(parallel=ParallelConfig(), optimizer=None, deterministic=_deterministic_supported(),
                             magi_chunk_size=CHUNK, **kw)
 
@@ -70,7 +80,7 @@ def test_align_without_switches_matches_lite_bitwise(magi_cfg, magi_source, dist
 
     _magi_deps()
     seq_lens = BATCHES[tag]
-    knobs = dict(L.MINIMAX_TRAINING_IMPL)
+    knobs = {**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}
     lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **knobs), pre_roll=True)
     lite2 = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **knobs), pre_roll=True)  # A/A control
     align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=()))
@@ -96,7 +106,7 @@ def test_align_without_switches_matches_lite_bitwise(magi_cfg, magi_source, dist
     assert over == {}, (bound, dict(list(over.items())[:10]))
     bitwise = sum(1 for n in diff if diff[n] == 0.0)
     print(f"\n{tag}: forward bitwise; grads {bitwise}/{len(diff)} bitwise, max rel diff {max(diff.values()):.2e} "
-          f"vs A/A bound {bound:.2e} (Magi deterministic unsupported)", flush=True)
+          f"vs A/A bound {bound:.2e} (Magi deterministic unsupported, dense {_dense_backend()})", flush=True)
 
 
 def test_control_unrolled_labels_change_the_loss(magi_cfg, magi_source, dist):
@@ -106,7 +116,7 @@ def test_control_unrolled_labels_change_the_loss(magi_cfg, magi_source, dist):
 
     _magi_deps()
     seq_lens = BATCHES["packed"]
-    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **L.MINIMAX_TRAINING_IMPL), pre_roll=True)
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
     align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=(), roll_labels=False))
     assert not torch.equal(lite["loss"], align["loss"])
 
@@ -124,7 +134,7 @@ def test_rmsnorm_switch_runs_and_only_perturbs_by_norm_rounding(magi_cfg, magi_s
     except ImportError as exc:
         pytest.skip(str(exc))
     seq_lens = BATCHES["packed"]
-    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **L.MINIMAX_TRAINING_IMPL), pre_roll=True)
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
     torch.manual_seed(7)
     bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("rmsnorm",)))
     chunk = bundle.chunks[0]
@@ -149,7 +159,7 @@ def test_router_switch_runs_and_keeps_routing_close_to_lite(magi_cfg, magi_sourc
 
     _magi_deps()
     seq_lens = BATCHES["packed"]
-    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **L.MINIMAX_TRAINING_IMPL), pre_roll=True)
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
     torch.manual_seed(7)
     bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("rmsnorm", "router")))
     chunk = bundle.chunks[0]
