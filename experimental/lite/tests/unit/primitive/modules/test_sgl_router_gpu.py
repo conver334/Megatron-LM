@@ -59,13 +59,16 @@ def test_backward_matches_formula():
     g = torch.randn_like(scores)
     scores.backward(g)
 
+    def _ste_bf16(t):  # forward uses the bf16-rounded value, gradient passes straight through (no bf16 grad rounding)
+        return t + (t.detach().to(torch.bfloat16).float() - t.detach())
+
     xr = x.detach().float().requires_grad_(True)
     wr = r.gate.weight.detach().clone().requires_grad_(True)
-    logits = torch.mm(xr.to(torch.bfloat16).float(), wr.to(torch.bfloat16).float().t())
+    logits = torch.mm(_ste_bf16(xr), _ste_bf16(wr).t())
     sel = torch.gather(torch.sigmoid(logits), 1, ids)
     probs = sel / sel.sum(1, keepdim=True) * 2.0
     probs.backward(g)
-    torch.testing.assert_close(r.gate.weight.grad, wr.grad, rtol=1e-3, atol=1e-6)
+    torch.testing.assert_close(r.gate.weight.grad, wr.grad, rtol=1e-4, atol=1e-6)
     torch.testing.assert_close(x.grad.float(), xr.grad, rtol=2e-2, atol=1e-4)
 
 
