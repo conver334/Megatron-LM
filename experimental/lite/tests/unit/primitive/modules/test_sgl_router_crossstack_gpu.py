@@ -199,13 +199,20 @@ def test_fork_router_path_equals_mlite_router_module(monkeypatch):
     print(f"\nrouter module vs fork path ({src} gate): bitwise for M in {ROWS}", flush=True)
 
 
-def test_crossstack_comparison_detects_a_planted_split_mismatch(monkeypatch):
-    """Planted error: a different high/low split scale on the mlite side must break byte equality."""
+def test_crossstack_comparison_detects_planted_errors(monkeypatch):
+    """Planted errors must break byte equality: dropping the low part, or a non-power-of-two split scale.
+    (A power-of-two scale change such as 1/128 is byte-neutral: the bf16 low part scales exactly.)"""
     from megatron.lite.primitive.kernels import sgl_deepgemm
 
     fork_linear, _, _ = _fork()
     w, bias, _ = _gate_params(3)
     torch.manual_seed(11)
     x = torch.randn(512, H, device="cuda", dtype=torch.bfloat16)
+    ref = fork_linear(x, w)
+    assert torch.equal(ref, sgl_deepgemm.bf16xfp32_gemm(x, w))
+    hi_only = sgl_deepgemm.bf16_gemm_f32(x, sgl_deepgemm.split_fp32_weight(w)[0])
+    assert not torch.equal(ref, hi_only)
     monkeypatch.setattr(sgl_deepgemm, "WEIGHT_SPLIT_SCALE", 1.0 / 128.0)
-    assert not torch.equal(fork_linear(x, w), sgl_deepgemm.bf16xfp32_gemm(x, w))
+    assert torch.equal(ref, sgl_deepgemm.bf16xfp32_gemm(x, w))  # exact power-of-two rescale
+    monkeypatch.setattr(sgl_deepgemm, "WEIGHT_SPLIT_SCALE", 1.0 / 3.0)
+    assert not torch.equal(ref, sgl_deepgemm.bf16xfp32_gemm(x, w))
