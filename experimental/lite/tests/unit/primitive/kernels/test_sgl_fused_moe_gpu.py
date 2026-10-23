@@ -144,7 +144,8 @@ def test_moe_sum_reduce_order_is_observable_with_cancellation():
     x = torch.tensor([[[big], [1.0], [-big], [1.0]], [[1.0], [big], [1.0], [-big]], [[big], [1.0], [-big], [0.0]]],
                      device="cuda", dtype=torch.bfloat16)  # [3, K=4, H=1]
     out = moe_sum_reduce(x)
-    assert out[:, 0].tolist() == [1.0, 0.0, 1.0]  # sequential: ((big+1)-big)+1 = 1; ((1+big)+1)-big = 0
-    assert moe_sum_reduce(x, scale=3.0)[2, 0].item() == 3.0  # scale after the fp32 sum
+    # fp32 absorbs the 1.0 next to 2**25: sequential ((big+1)-big)+1 = 1, ((1+big)+1)-big = 0, ((big+1)-big)+0 = 0
+    assert out[:, 0].tolist() == [1.0, 0.0, 0.0]
+    assert moe_sum_reduce(x, scale=3.0)[0, 0].item() == 3.0  # scale after the fp32 sum
     pairwise = ((x[:, 0].float() + x[:, 1].float()) + (x[:, 2].float() + x[:, 3].float())).to(torch.bfloat16)
     assert not torch.equal(out, pairwise)
