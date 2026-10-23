@@ -321,16 +321,16 @@ def test_experts_swap_touches_moe_layers_only(monkeypatch):
 
     class SglM3MoELayer:
         @classmethod
-        def swap_in(cls, module, *, shared):
-            seen.append((module, shared))
+        def swap_in(cls, module, *, shared, combine, ep_size):
+            seen.append((module, shared, combine, ep_size))
             return module
 
     fake.SglM3MoELayer = SglM3MoELayer
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     moe_layer = SimpleNamespace(moe=object())
     for owner in (moe_layer, SimpleNamespace(moe=None), SimpleNamespace()):
-        M.ALIGN_SWAPS["experts"](owner, SimpleNamespace(), None, moe_shared="fused")
-    assert seen == [(moe_layer.moe, "fused")]
+        M.ALIGN_SWAPS["experts"](owner, SimpleNamespace(), None, moe_shared="fused", moe_combine="expert_asc", moe_ep_size=8)
+    assert seen == [(moe_layer.moe, "fused", "expert_asc", 8)]
 
 
 def test_moe_shared_option_reaches_align_opts(monkeypatch):
