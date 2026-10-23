@@ -84,7 +84,7 @@ def install_stubs() -> bool:
     _exec = _types.SimpleNamespace(deterministic=_types.SimpleNamespace(enable_deterministic_inference=True),
                                    moe=_types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False, ep_num_redundant_experts=0))
     sys.modules["sglang.srt.runtime_context"] = _AttrModule("sglang.srt.runtime_context", {"get_exec": lambda: _exec}, lambda name: (lambda *a, **k: None))
-    utils._values.update({"get_device_name": lambda: "NVIDIA B200"})
+    utils._values.update({"get_device_name": lambda: "NVIDIA B200", "ceil_div": lambda x, y: (x + y - 1) // y})
     # fused_moe_triton_kernels.py: quant helpers are never reached for bf16; environment probes as on a CUDA box
     for q in ("sglang.kernels.ops.quantization", "sglang.kernels.ops.quantization.fp8_kernel", "sglang.kernels.ops.quantization.int8_kernel"):
         sys.modules[q] = _AttrModule(q, {}, lambda name: (lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"quant path {name} not under test"))))
@@ -159,3 +159,11 @@ def load_fork_fused_moe():
     tu.__path__ = [os.path.join(fork_root(), "srt/layers/moe/moe_runner/triton_utils")]  # relative imports hit the fork files
     _module("sglang.srt.utils.custom_op", register_custom_op=lambda *a, **k: (lambda fn: fn))
     return load("srt/layers/moe/moe_runner/triton_utils/fused_moe.py", "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")
+
+
+@functools.lru_cache(maxsize=None)
+def load_fork_ep_kernels():
+    """The fork's Triton EP kernels (ep_scatter / ep_gather / masked silu) by path: the DeepEP + DeepGEMM runner's
+    per-rank glue, SGLang's own code."""
+    install_stubs()
+    return load("kernels/ops/moe/ep_moe_kernels.py", "sglang.kernels.ops.moe.ep_moe_kernels")

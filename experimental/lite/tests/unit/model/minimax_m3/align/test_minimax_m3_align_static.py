@@ -37,7 +37,7 @@ def test_align_impl_config_is_lite_plus_align_modules_with_training_recipe_defau
 
     lite_names = {f.name for f in fields(L.ImplConfig)}
     align_names = {f.name for f in fields(A.ImplConfig)}
-    assert align_names - lite_names == {"align_modules", "align_router_gate", "align_moe_shared", "align_moe_combine", "align_moe_ep_size", "roll_labels"}
+    assert align_names - lite_names == {"align_modules", "align_router_gate", "align_moe_shared", "align_moe_combine", "align_moe_ep_size", "align_moe_experts", "roll_labels"}
     cfg = A.ImplConfig()
     assert cfg.align_modules == ()
     for k, v in L.MINIMAX_TRAINING_IMPL.items():
@@ -103,7 +103,7 @@ def test_align_build_model_forwards_lite_cfg_and_align_modules(monkeypatch):
     assert bundle.forward_step is A._forward_step
     assert bundle.chunks[0].align_roll_labels is True
     tc = seen["train_cfg"]
-    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "fp32", "moe_shared": "separate", "moe_combine": "slot", "moe_ep_size": 1}
+    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "fp32", "moe_shared": "separate", "moe_combine": "slot", "moe_ep_size": 1, "moe_experts": "triton"}
     assert tc.rope_fusion is True and tc.msa_index_input_norm == "fused" and tc.moe_permute_fusion is False
     assert bundle.chunks[0].magi_settings.dense_kernel_backend == "fa4_varlen"
 
@@ -321,16 +321,16 @@ def test_experts_swap_touches_moe_layers_only(monkeypatch):
 
     class SglM3MoELayer:
         @classmethod
-        def swap_in(cls, module, *, shared, combine, ep_size):
-            seen.append((module, shared, combine, ep_size))
+        def swap_in(cls, module, *, shared, combine, ep_size, experts):
+            seen.append((module, shared, combine, ep_size, experts))
             return module
 
     fake.SglM3MoELayer = SglM3MoELayer
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     moe_layer = SimpleNamespace(moe=object())
     for owner in (moe_layer, SimpleNamespace(moe=None), SimpleNamespace()):
-        M.ALIGN_SWAPS["experts"](owner, SimpleNamespace(), None, moe_shared="fused", moe_combine="expert_asc", moe_ep_size=8)
-    assert seen == [(moe_layer.moe, "fused", "expert_asc", 8)]
+        M.ALIGN_SWAPS["experts"](owner, SimpleNamespace(), None, moe_shared="fused", moe_combine="expert_asc", moe_ep_size=8, moe_experts="deepgemm_ep")
+    assert seen == [(moe_layer.moe, "fused", "expert_asc", 8, "deepgemm_ep")]
 
 
 def test_moe_shared_option_reaches_align_opts(monkeypatch):
@@ -361,8 +361,9 @@ def test_moe_shared_option_reaches_align_opts(monkeypatch):
     monkeypatch.setattr(L.magi_msa, "validate_kernel_shapes", lambda **_k: None)
     monkeypatch.setattr(L.magi_msa, "build_msa_config", lambda *_a, **_k: object())
     A.build_model(MiniMaxM3Config(), impl_cfg=A.ImplConfig(optimizer=None, align_modules=("router", "experts"), align_moe_shared="fused",
-                                                            align_moe_combine="expert_asc", align_moe_ep_size=8))
-    assert seen["train_cfg"].align_opts == {"router_gate": "fp32", "moe_shared": "fused", "moe_combine": "expert_asc", "moe_ep_size": 8}
+                                                            align_moe_combine="expert_asc", align_moe_ep_size=8, align_moe_experts="deepgemm_ep"))
+    assert seen["train_cfg"].align_opts == {"router_gate": "fp32", "moe_shared": "fused", "moe_combine": "expert_asc", "moe_ep_size": 8,
+                                            "moe_experts": "deepgemm_ep"}
 
 
 def test_experts_swap_in_guards():
@@ -396,3 +397,9 @@ def test_experts_swap_in_guards():
     assert isinstance(m, SglM3MoELayer) and (m.align_moe_shared, m.align_moe_combine, m.align_moe_ep_size) == ("separate", "slot", 1)
     m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), combine="ep_normal", ep_size=8)
     assert (m.align_moe_combine, m.align_moe_ep_size) == ("ep_normal", 8)
+    with pytest.raises(ValueError, match="experts="):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="cutlass")
+    with pytest.raises(ValueError, match="EP=1"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), shared="fused", experts="deepgemm_ep", ep_size=8)
+    m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ep", ep_size=8)
+    assert (m.align_moe_experts, m.align_moe_ep_size) == ("deepgemm_ep", 8)

@@ -65,6 +65,9 @@ class ImplConfig(_lite.ImplConfig):
     # (ascending expert id, the EP contract candidate), "ep_normal" (DeepEP normal-mode shape for align_moe_ep_size ranks)
     align_moe_combine: str = "slot"
     align_moe_ep_size: int = 1
+    # expert kernels: "triton" (SGLang EP=1 fused_moe) or "deepgemm_ep" (SGLang DeepEP normal + DeepGEMM bf16 runner
+    # over align_moe_ep_size ranks: ep_scatter layout, m-grouped GEMMs, ep_gather, DeepEP combine)
+    align_moe_experts: str = "triton"
     # PackedBatch contract (verl_mlite, other protocols): labels/loss_mask arrive unrolled and the protocol rolls
     # them left per document (last token masked). lite does not roll; keep False only for lite-style batches.
     roll_labels: bool = True
@@ -117,7 +120,8 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         extra_train_cfg={
             "align_modules": tuple(impl_cfg.align_modules),
             "align_opts": {"router_gate": impl_cfg.align_router_gate, "moe_shared": impl_cfg.align_moe_shared,
-                           "moe_combine": impl_cfg.align_moe_combine, "moe_ep_size": impl_cfg.align_moe_ep_size},
+                           "moe_combine": impl_cfg.align_moe_combine, "moe_ep_size": impl_cfg.align_moe_ep_size,
+                           "moe_experts": impl_cfg.align_moe_experts},
         },
     )
     for chunk in bundle.chunks:

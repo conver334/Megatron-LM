@@ -469,7 +469,6 @@ def invoke_fused_moe_kernel_bf16(A, B, C, topk_weights, topk_ids, sorted_token_i
 
 
 COMBINE_MODES = ("slot", "expert_asc", "ep_normal")
-RANKS_PER_NODE = 8  # DeepEP NUM_MAX_NVL_PEERS: ranks beyond one node combine in two stages
 
 
 def moe_sum_reduce(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
@@ -506,23 +505,15 @@ def combine_slots(cache3: torch.Tensor, topk_ids: torch.Tensor, mode: str = "slo
         order = torch.argsort(ids, dim=1, stable=True)
         return moe_sum_reduce(torch.gather(cache3, 1, order[:, :, None].expand_as(cache3)), scale)
     if mode == "ep_normal":
+        from megatron.lite.primitive.kernels.sgl_deepgemm_moe import combine_rank_partials
+
         if num_experts is None or ep_size < 1 or num_experts % ep_size:
             raise ValueError(f"ep_normal needs num_experts divisible by ep_size, got {num_experts} / {ep_size}")
         ranks = ids // (num_experts // ep_size)
         zero = torch.zeros((), dtype=cache3.dtype, device=cache3.device)
-        n_nodes = (ep_size + RANKS_PER_NODE - 1) // RANKS_PER_NODE
-        acc = torch.zeros(cache3.shape[0], cache3.shape[2], dtype=torch.float32, device=cache3.device)
-        for node in range(n_nodes):
-            node_acc = torch.zeros_like(acc)
-            for r in range(node * RANKS_PER_NODE, min((node + 1) * RANKS_PER_NODE, ep_size)):
-                on_r = ranks == r
-                partial = moe_sum_reduce(torch.where(on_r[:, :, None], cache3, zero), scale)
-                node_acc = torch.where(on_r.any(dim=1)[:, None], node_acc + partial.float(), node_acc)
-            if n_nodes == 1:
-                return node_acc.to(cache3.dtype)
-            on_node = (ranks // RANKS_PER_NODE == node).any(dim=1)[:, None]
-            acc = torch.where(on_node, acc + node_acc.to(cache3.dtype).float(), acc)
-        return acc.to(cache3.dtype)
+        on = torch.stack([ranks == r for r in range(ep_size)])  # [R, T, K]
+        partials = torch.stack([moe_sum_reduce(torch.where(on[r][:, :, None], cache3, zero), scale) for r in range(ep_size)])
+        return combine_rank_partials(partials, on.any(dim=2))
     raise ValueError(f"combine mode {mode!r}; known: {COMBINE_MODES}")
 
 

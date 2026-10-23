@@ -453,3 +453,57 @@ def test_experts_switch_runs_close_to_lite_and_shared_modes_differ(magi_cfg, mag
     assert not torch.equal(align["log_probs"], other["log_probs"]), "shared-expert modes should differ in bytes"
     print(f"\nexperts switch (shared={shared}): {n_moe} MoE layers swapped, loss rel diff vs lite {rel:.2e}, "
           f"log_probs vs lite differ on {(lite['log_probs'] != align['log_probs']).float().mean().item():.3f} of tokens", flush=True)
+
+
+def test_experts_deepgemm_ep_path_runs_close_to_lite_and_differs_from_triton(magi_cfg, magi_source, dist):
+    """align_moe_experts="deepgemm_ep": MoE layers show SGLang's DeepEP-normal + DeepGEMM bf16 bytes over
+    align_moe_ep_size ranks; close to lite (kernel rounding only) and a different contract from the EP=1 Triton path."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.moe import SglM3MoELayer
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+
+    _magi_deps()
+    try:
+        deep_gemm_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    n_exp = magi_cfg.num_local_experts
+    ep = next(e for e in (8, 4, 2, 1) if n_exp % e == 0)
+    moe_io = {}
+
+    def _moe_hooks(tag):
+        def install(chunk):
+            for i, layer in enumerate(chunk.layers):
+                if layer.moe is not None:
+                    layer.moe.register_forward_hook(
+                        lambda m, inp, out, i=i: moe_io.__setitem__((tag, i), (inp[0].detach().clone(), out.detach().clone())))
+        return install
+
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}),
+                pre_roll=True, hooks=_moe_hooks("lite"))
+    cfg = dict(align_modules=("router", "experts"), align_moe_experts="deepgemm_ep", align_moe_ep_size=ep)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, **cfg))
+    chunk = bundle.chunks[0]
+    moes = [m for m in chunk.modules() if isinstance(m, SglM3MoELayer)]
+    assert moes and all((m.align_moe_experts, m.align_moe_ep_size) == ("deepgemm_ep", ep) for m in moes)
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, **cfg), hooks=_moe_hooks("align"))
+    triton = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router", "experts")), hooks=_moe_hooks("triton"))
+    first = min(i for (t, i) in moe_io if t == "lite")
+    x_l, y_l = moe_io[("lite", first)]
+    x_a, y_a = moe_io[("align", first)]
+    _, y_t = moe_io[("triton", first)]
+    assert torch.equal(x_l, x_a)
+    scale = y_l.float().abs().max().item()
+    torch.testing.assert_close(y_a.float(), y_l.float(), rtol=2 ** -5, atol=2 ** -6 * scale)
+    assert torch.isfinite(align["loss"]).all()
+    rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-3, rel
+    assert not torch.equal(y_a, y_t), "DeepEP+DeepGEMM path must not coincide with the Triton EP=1 path"
+    print(f"\nDeepEP+DeepGEMM experts (ep={ep}, {n_exp} experts): {len(moes)} MoE layers swapped, loss rel diff vs lite {rel:.2e}; "
+          f"first MoE layer vs lite {(y_l != y_a).float().mean().item():.4f} of bf16 outputs differ (max |d| "
+          f"{(y_l.float() - y_a.float()).abs().max().item():.3e}), vs Triton path {(y_t != y_a).float().mean().item():.4f}", flush=True)
