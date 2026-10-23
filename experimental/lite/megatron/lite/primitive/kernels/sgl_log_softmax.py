@@ -2,7 +2,8 @@
 """SGLang batch-invariant ``log_softmax`` (sglang 627bf1b2 srt/batch_invariant_ops/batch_invariant_ops.py,
 ``_log_softmax_kernel`` vendored verbatim) plus a stats twin with the same two reduction loops that stores
 (max, logsumexp) per row, so the label's logprob ``(x - max) - lse`` costs O(rows) memory and is bitwise the
-full kernel's element; the twin upcasts bf16 logits in the kernel, so no fp32 copy of the logits is needed. This is the inference logprob contract (fp32 logits, original logprob, no temperature)."""
+full kernel's element. Inputs must be fp32 like SGLang's ``logits.float()``: loading bf16 and upcasting in the
+kernel changes Triton's reduction layout and the low bits, so bf16 logits are converted in row chunks. This is the inference logprob contract (fp32 logits, original logprob, no temperature)."""
 
 from __future__ import annotations
 
@@ -111,7 +112,7 @@ def _log_softmax_stats_kernel(
     mask_init = col_idx_init < n_cols
     vals_init = tl.load(
         row_start_ptr + col_idx_init, mask=mask_init, other=-float("inf")
-    ).to(tl.float32)
+    )
     max_val = tl.max(vals_init)
 
     # Continue with remaining blocks
@@ -120,7 +121,7 @@ def _log_softmax_stats_kernel(
         mask = col_idx < n_cols
 
         # Load values
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=-float("inf")).to(tl.float32)
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=-float("inf"))
 
         # Update maximum
         max_val = tl.max(tl.maximum(vals, max_val))
@@ -134,7 +135,7 @@ def _log_softmax_stats_kernel(
         mask = col_idx < n_cols
 
         # Load values
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0).to(tl.float32)
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
 
         # Compute exp(x - max_val) and accumulate
         exp_vals = tl.exp(vals - max_val)
@@ -155,17 +156,20 @@ def log_softmax(x: torch.Tensor) -> torch.Tensor:
     return out.reshape(x.shape)
 
 
-def log_softmax_stats(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """(max, logsumexp) per row in fp32; bf16 input is upcast in the kernel (same values as ``x.float()``)."""
-    x2 = x.reshape(-1, x.shape[-1]).contiguous()
+def log_softmax_stats(x: torch.Tensor, chunk_rows: int = 1024) -> tuple[torch.Tensor, torch.Tensor]:
+    """(max, logsumexp) per row in fp32 with the kernel's first two loops; non-fp32 input is converted to fp32 in
+    row chunks (SGLang runs the kernel on ``logits.float()``)."""
+    x2 = x.reshape(-1, x.shape[-1])
     mx = torch.empty(x2.shape[0], dtype=torch.float32, device=x2.device)
     lse = torch.empty_like(mx)
-    _log_softmax_stats_kernel[(x2.shape[0],)](x2, mx, lse, x2.stride(0), x2.shape[1], BLOCK_SIZE=BLOCK_SIZE)
+    for start in range(0, x2.shape[0], chunk_rows):
+        xc = x2[start : start + chunk_rows].float().contiguous()
+        _log_softmax_stats_kernel[(xc.shape[0],)](xc, mx[start:], lse[start:], xc.stride(0), xc.shape[1], BLOCK_SIZE=BLOCK_SIZE)
     return mx.reshape(x.shape[:-1]), lse.reshape(x.shape[:-1])
 
 
 def token_logprob(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """logprob of ``labels`` under ``log_softmax(logits)`` with the kernel's exact arithmetic: (x - max) - lse."""
+    """logprob of ``labels`` under ``log_softmax(logits.float())`` with the kernel's exact arithmetic: (x - max) - lse."""
     mx, lse = log_softmax_stats(logits)
     picked = torch.gather(logits, -1, labels.unsqueeze(-1)).squeeze(-1).float()
     return (picked - mx) - lse

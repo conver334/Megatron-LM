@@ -21,11 +21,16 @@ def test_stats_twin_matches_full_kernel_and_torch_within_tolerance():
     full = torch.gather(log_softmax(x), 1, labels[:, None]).squeeze(1)
     ours = token_logprob(x, labels)
     assert torch.equal(ours, full)
-    assert torch.equal(token_logprob(x_bf16, labels), full)  # bf16 logits upcast in-kernel: no fp32 copy needed
+    assert torch.equal(token_logprob(x_bf16, labels), full)  # bf16 logits converted per row chunk like SGLang's .float()
     ref = torch.gather(torch.log_softmax(x, -1), 1, labels[:, None]).squeeze(1)
     torch.testing.assert_close(ours, ref, rtol=1e-5, atol=1e-5)
     print(f"\nBI log_softmax vs torch.log_softmax at the label: {(ours != ref).sum().item()}/{ours.numel()} fp32 mismatches")
     assert torch.equal(token_logprob(x[:7], labels[:7]), ours[:7])  # per-row kernel: batch-invariant
+    from megatron.lite.primitive.kernels.sgl_log_softmax import log_softmax_stats
+
+    mx, lse = log_softmax_stats(x_bf16, chunk_rows=5)  # chunking must not change bytes
+    mx2, lse2 = log_softmax_stats(x)
+    assert torch.equal(mx, mx2) and torch.equal(lse, lse2)
 
 
 def test_vendored_kernel_equals_fork_kernel_by_path():
