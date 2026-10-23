@@ -385,7 +385,18 @@ def test_experts_switch_runs_close_to_lite_and_shared_modes_differ(magi_cfg, mag
     except ImportError as exc:
         pytest.skip(str(exc))
     seq_lens = BATCHES["packed"]
-    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    moe_io = {}
+
+    def _moe_hooks(tag):
+        def install(chunk):
+            for i, layer in enumerate(chunk.layers):
+                if layer.moe is not None:
+                    layer.moe.register_forward_hook(
+                        lambda m, inp, out, i=i: moe_io.__setitem__((tag, i), (inp[0].detach().clone(), out.detach().clone())))
+        return install
+
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}),
+                pre_roll=True, hooks=_moe_hooks("lite"))
     torch.manual_seed(7)
     bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("router", "experts"), align_moe_shared=shared))
     chunk = bundle.chunks[0]
@@ -393,9 +404,16 @@ def test_experts_switch_runs_close_to_lite_and_shared_modes_differ(magi_cfg, mag
     assert sum(isinstance(m, SglM3MoELayer) for m in chunk.modules()) == n_moe > 0
     del bundle, chunk
     torch.cuda.empty_cache()
-    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router", "experts"), align_moe_shared=shared))
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router", "experts"), align_moe_shared=shared),
+                 hooks=_moe_hooks("align"))
     other = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router", "experts"),
                                                                align_moe_shared="fused" if shared == "separate" else "separate"))
+    first = min(i for (t, i) in moe_io if t == "lite")
+    x_l, y_l = moe_io[("lite", first)]
+    x_a, y_a = moe_io[("align", first)]
+    assert torch.equal(x_l, x_a), "first MoE layer must see identical inputs (dense layers are lite-identical here)"
+    print(f"\nfirst MoE layer ({first}) on identical input: SGLang fused-MoE path vs lite dispatcher+TE grouped GEMM: "
+          f"{(y_l != y_a).float().mean().item():.4f} of bf16 outputs differ, max |d| {(y_l.float() - y_a.float()).abs().max().item():.3e}", flush=True)
     assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
     rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
     assert rel < 1e-2, rel
