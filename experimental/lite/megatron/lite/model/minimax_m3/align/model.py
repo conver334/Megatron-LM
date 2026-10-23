@@ -170,3 +170,10 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
         from megatron.lite.primitive.kernels.sgl_norm import visible_input_norm
 
         return visible_forward(visible_input_norm(h, self.norm.weight, self.norm.eps, self.layers[-1]._residual_pair), native)
+
+
+def _layer_factory(align_modules: tuple[str, ...], align_opts: dict | None = None):
+    def make(config, ps, layer_idx, **kwargs) -> nn.Module:
+        return MiniMaxM3AlignLayer(config, ps, layer_idx, align_modules=align_modules, align_opts=align_opts, **kwargs)
+
+    return make
