@@ -121,3 +121,41 @@ def load(rel_path: str, modname: str):
     sys.modules[modname] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+@functools.lru_cache(maxsize=None)
+def load_fork_fused_moe():
+    """The fork's ``fused_moe.py`` (``fused_experts_impl`` orchestration, M3's bf16 EP=1 path) with the pieces the
+    training image cannot run stubbed: ``sgl_kernel.moe_sum_reduce`` -> the fork's own Triton ``moe_sum_reduce_triton``
+    (an independent implementation of the same sum), ``sgl_kernel`` ``moe_align_block_size`` -> mlite's torch layout
+    (layout-only, see the order-invariance test), symmetric memory / tp group / custom-op registration -> no-ops."""
+    install_stubs()
+    kernels = load("kernels/ops/moe/fused_moe_triton_kernels.py", "sglang.kernels.ops.moe.fused_moe_triton_kernels")
+    _module("sglang.kernels.ops.activation")
+    load("kernels/ops/activation/swigluoai_triton.py", "sglang.kernels.ops.activation.swigluoai_triton")
+    _module("sglang.kernels.ops.activation.activation", gelu_and_mul=None, silu_and_mul=None)
+    from megatron.lite.primitive.kernels.sgl_fused_moe import moe_align_block_size as _align
+
+    def _sgl_align(topk_ids, num_experts_plus1, block_size, sorted_ids, expert_ids, num_tokens_post_pad, *_a, **_k):
+        s, e, n = _align(topk_ids, block_size, num_experts_plus1 - 1)
+        sorted_ids[: s.numel()].copy_(s)
+        expert_ids[: e.numel()].copy_(e)
+        num_tokens_post_pad.copy_(n)
+
+    sys.modules["sglang.kernels.ops.moe"].moe_align_block_size = _sgl_align
+    _module("sglang.kernels.ops.moe.moe_align_small_numel", SMALL_NUMEL_LIMIT=0, moe_align_small_numel=None)
+    _module("sgl_kernel", moe_sum_reduce=kernels.moe_sum_reduce_triton)
+    _module("sglang.srt.distributed", get_tp_group=lambda: None)
+    _module("sglang.srt.distributed.device_communicators")
+    _module("sglang.srt.distributed.device_communicators.pynccl_allocator", use_symmetric_memory=lambda *a, **k: contextlib.nullcontext())
+    _module("sglang.srt.layers.dp_attention", is_allocation_symmetric=lambda: False)
+
+    class MoeRunnerConfig:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    _module("sglang.srt.layers.moe.moe_runner", MoeRunnerConfig=MoeRunnerConfig)
+    tu = _module("sglang.srt.layers.moe.moe_runner.triton_utils", get_config=lambda: None)
+    tu.__path__ = [os.path.join(fork_root(), "srt/layers/moe/moe_runner/triton_utils")]  # relative imports hit the fork files
+    _module("sglang.srt.utils.custom_op", register_custom_op=lambda *a, **k: (lambda fn: fn))
+    return load("srt/layers/moe/moe_runner/triton_utils/fused_moe.py", "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")

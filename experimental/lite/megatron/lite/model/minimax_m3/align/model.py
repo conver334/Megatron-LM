@@ -80,13 +80,15 @@ def _swap_lm_head(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, 
         SglVocabParallelOutput.swap_in(head)
 
 
-def _swap_experts(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *, moe_shared: str = "separate", **_opts) -> None:
-    """MoE layer -> SGLang Triton fused-MoE bytes (deterministic config), shared expert separate or fused slot."""
+def _swap_experts(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *, moe_shared: str = "separate",
+                  moe_combine: str = "slot", moe_ep_size: int = 1, **_opts) -> None:
+    """MoE layer -> SGLang Triton fused-MoE bytes (deterministic config), shared expert separate or fused slot,
+    slot accumulation order per the combine contract."""
     from megatron.lite.model.minimax_m3.align.moe import SglM3MoELayer
 
     moe = getattr(owner, "moe", None)
     if moe is not None:
-        SglM3MoELayer.swap_in(moe, shared=moe_shared)
+        SglM3MoELayer.swap_in(moe, shared=moe_shared, combine=moe_combine, ep_size=moe_ep_size)
 
 
 # name -> swap, applied to every layer and then to the model (final norm / head live there);

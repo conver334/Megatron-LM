@@ -468,20 +468,53 @@ def invoke_fused_moe_kernel_bf16(A, B, C, topk_weights, topk_ids, sorted_token_i
     )
 
 
+COMBINE_MODES = ("slot", "expert_asc", "ep_normal")
+
+
 def moe_sum_reduce(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    """sgl_kernel moe_sum_reduce: ``acc = sum_k float(x[:, k])`` in slot order, ``acc *= scale``, bf16 RN."""
-    acc = x[:, 0].float()
-    for k in range(1, x.shape[1]):
+    """sgl_kernel / fork-Triton moe_sum_reduce: ``acc = 0; acc += float(x[:, k])`` in slot order, ``acc *= scale``,
+    bf16 RN (the +0.0 start turns an all -0.0 row into +0.0, as the kernels do)."""
+    acc = torch.zeros(x.shape[0], x.shape[2], dtype=torch.float32, device=x.device)
+    for k in range(x.shape[1]):
         acc = acc + x[:, k].float()
     if scale != 1.0:
         acc = acc * scale
     return acc.to(x.dtype)
 
 
+def combine_slots(cache3: torch.Tensor, topk_ids: torch.Tensor, mode: str = "slot", *, num_experts: int | None = None,
+                  ep_size: int = 1, scale: float = 1.0) -> torch.Tensor:
+    """[T, K, H] slot outputs (routed weights applied) -> [T, H] bf16 in a declared accumulation order.
+    slot: SGLang EP=1 Triton runner (moe_sum_reduce, slot order).
+    expert_asc: slots summed in ascending expert id (the EP accumulation-order contract candidate).
+    ep_normal: DeepEP normal-mode combine shape: each of ``ep_size`` ranks (experts in contiguous blocks) sums its
+    slots in slot order with remote slots as zeros to a bf16 partial, the ranks holding a slot are added in
+    ascending rank order in fp32 and rounded once more."""
+    if mode == "slot":
+        return moe_sum_reduce(cache3, scale)
+    ids = topk_ids.to(torch.int64)
+    if mode == "expert_asc":
+        order = torch.argsort(ids, dim=1, stable=True)
+        return moe_sum_reduce(torch.gather(cache3, 1, order[:, :, None].expand_as(cache3)), scale)
+    if mode == "ep_normal":
+        if num_experts is None or ep_size < 1 or num_experts % ep_size:
+            raise ValueError(f"ep_normal needs num_experts divisible by ep_size, got {num_experts} / {ep_size}")
+        ranks = ids // (num_experts // ep_size)
+        zero = torch.zeros((), dtype=cache3.dtype, device=cache3.device)
+        acc = torch.zeros(cache3.shape[0], cache3.shape[2], dtype=torch.float32, device=cache3.device)
+        for r in range(ep_size):
+            on_r = ranks == r
+            partial = moe_sum_reduce(torch.where(on_r[:, :, None], cache3, zero), scale)
+            acc = torch.where(on_r.any(dim=1)[:, None], acc + partial.float(), acc)
+        return acc.to(cache3.dtype)
+    raise ValueError(f"combine mode {mode!r}; known: {COMBINE_MODES}")
+
+
 def fused_experts_bf16(hidden: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, topk_weights: torch.Tensor,
-                       topk_ids: torch.Tensor, alpha: float, limit: float, routed_scaling_factor: float = 1.0) -> torch.Tensor:
+                       topk_ids: torch.Tensor, alpha: float, limit: float, routed_scaling_factor: float = 1.0,
+                       combine: str = "slot", ep_size: int = 1) -> torch.Tensor:
     """SGLang ``fused_experts`` for M3: hidden [T, H] bf16, w13 [E, 2I, H], w2 [E, H, I], weights fp32 [T, K],
-    ids int32 [T, K] (SGLang slot order) -> [T, H] bf16."""
+    ids int32 [T, K] (SGLang slot order) -> [T, H] bf16; ``combine`` picks the slot accumulation order (combine_slots)."""
     T, H = hidden.shape
     E, N, _ = w13.shape
     K = topk_ids.shape[1]
@@ -493,4 +526,4 @@ def fused_experts_bf16(hidden: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor
     cache2 = swigluoai(cache1, alpha, limit)
     cache3 = torch.empty(T, K, w2.shape[1], dtype=hidden.dtype, device=hidden.device)
     invoke_fused_moe_kernel_bf16(cache2, w2, cache3, topk_weights, topk_ids, sorted_ids, expert_ids, n_post, True, 1, router_topk=K)
-    return moe_sum_reduce(cache3, routed_scaling_factor)
+    return combine_slots(cache3, topk_ids, combine, num_experts=E, ep_size=ep_size, scale=routed_scaling_factor)

@@ -37,7 +37,7 @@ def test_align_impl_config_is_lite_plus_align_modules_with_training_recipe_defau
 
     lite_names = {f.name for f in fields(L.ImplConfig)}
     align_names = {f.name for f in fields(A.ImplConfig)}
-    assert align_names - lite_names == {"align_modules", "align_router_gate", "align_moe_shared", "roll_labels"}
+    assert align_names - lite_names == {"align_modules", "align_router_gate", "align_moe_shared", "align_moe_combine", "align_moe_ep_size", "roll_labels"}
     cfg = A.ImplConfig()
     assert cfg.align_modules == ()
     for k, v in L.MINIMAX_TRAINING_IMPL.items():
@@ -103,7 +103,7 @@ def test_align_build_model_forwards_lite_cfg_and_align_modules(monkeypatch):
     assert bundle.forward_step is A._forward_step
     assert bundle.chunks[0].align_roll_labels is True
     tc = seen["train_cfg"]
-    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "fp32", "moe_shared": "separate"}
+    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "fp32", "moe_shared": "separate", "moe_combine": "slot", "moe_ep_size": 1}
     assert tc.rope_fusion is True and tc.msa_index_input_norm == "fused" and tc.moe_permute_fusion is False
     assert bundle.chunks[0].magi_settings.dense_kernel_backend == "fa4_varlen"
 
@@ -360,8 +360,9 @@ def test_moe_shared_option_reaches_align_opts(monkeypatch):
     monkeypatch.setattr(L.magi_msa, "validate_device", lambda: None)
     monkeypatch.setattr(L.magi_msa, "validate_kernel_shapes", lambda **_k: None)
     monkeypatch.setattr(L.magi_msa, "build_msa_config", lambda *_a, **_k: object())
-    A.build_model(MiniMaxM3Config(), impl_cfg=A.ImplConfig(optimizer=None, align_modules=("router", "experts"), align_moe_shared="fused"))
-    assert seen["train_cfg"].align_opts == {"router_gate": "fp32", "moe_shared": "fused"}
+    A.build_model(MiniMaxM3Config(), impl_cfg=A.ImplConfig(optimizer=None, align_modules=("router", "experts"), align_moe_shared="fused",
+                                                            align_moe_combine="expert_asc", align_moe_ep_size=8))
+    assert seen["train_cfg"].align_opts == {"router_gate": "fp32", "moe_shared": "fused", "moe_combine": "expert_asc", "moe_ep_size": 8}
 
 
 def test_experts_swap_in_guards():
@@ -372,7 +373,7 @@ def test_experts_swap_in_guards():
     def fake_moe(router_cls, ep=1):
         m = torch.nn.Module()
         m.dispatcher = SimpleNamespace(ep_size=ep)
-        m.experts = SimpleNamespace(etp_group=None)
+        m.experts = SimpleNamespace(etp_group=None, num_local_experts=128)
         r = torch.nn.Module()
         r.gate = torch.nn.Module()
         r.__class__ = router_cls
@@ -385,5 +386,13 @@ def test_experts_swap_in_guards():
         SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter, ep=2))
     with pytest.raises(NotImplementedError, match="router switch"):
         SglM3MoELayer.swap_in(fake_moe(SigmoidTopKRouter))
+    with pytest.raises(ValueError, match="combine"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), combine="pairwise")
+    with pytest.raises(ValueError, match="EP=1"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), shared="fused", combine="ep_normal", ep_size=8)
+    with pytest.raises(ValueError, match="divide"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), combine="ep_normal", ep_size=7)
     m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), shared="separate")
-    assert isinstance(m, SglM3MoELayer) and m.align_moe_shared == "separate"
+    assert isinstance(m, SglM3MoELayer) and (m.align_moe_shared, m.align_moe_combine, m.align_moe_ep_size) == ("separate", "slot", 1)
+    m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), combine="ep_normal", ep_size=8)
+    assert (m.align_moe_combine, m.align_moe_ep_size) == ("ep_normal", 8)
