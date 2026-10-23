@@ -129,12 +129,10 @@ def test_qkv_swap_shows_sglang_norm_and_gemm_bytes_and_keeps_te_backward(with_no
     if with_norm_out:
         assert torch.equal(norm_sw, normed)
     g = torch.randn_like(out_ref)
-    if with_norm_out:
+    if with_norm_out:  # one backward: TE's autograd function frees its saved tensors after the first pass
         g2 = torch.randn_like(norm_ref)
-        (out_ref * g).sum().backward(retain_graph=True)
-        (norm_ref * g2).sum().backward()
-        (out_sw * g).sum().backward(retain_graph=True)
-        (norm_sw * g2).sum().backward()
+        ((out_ref * g).sum() + (norm_ref * g2).sum()).backward()
+        ((out_sw * g).sum() + (norm_sw * g2).sum()).backward()
     else:
         out_ref.backward(g)
         out_sw.backward(g)
