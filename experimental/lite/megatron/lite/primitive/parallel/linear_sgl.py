@@ -41,17 +41,9 @@ class SglColumnParallelLinear(ColumnParallelLinear):
         return module
 
     def _visible_norm(self, x: torch.Tensor) -> torch.Tensor:
-        from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm_kernel, gemma_rmsnorm_kernel
+        from megatron.lite.primitive.kernels.sgl_norm import visible_input_norm
 
-        w = self.linear.layer_norm_weight.detach().to(x.dtype)
-        pair = self._residual_pair
-        if pair is None:
-            return gemma_rmsnorm_kernel()(x.reshape(-1, x.shape[-1]).contiguous(), w, self.linear.eps).reshape(x.shape)
-        delta, residual = pair
-        hid = delta.detach().reshape(-1, x.shape[-1]).contiguous().clone()
-        res = residual.detach().reshape(-1, x.shape[-1]).contiguous().clone()
-        gemma_fused_add_rmsnorm_kernel()(hid, res, w, self.linear.eps)
-        return hid.reshape(x.shape)
+        return visible_input_norm(x, self.linear.layer_norm_weight, self.linear.eps, self._residual_pair)
 
     def forward(self, x: torch.Tensor):
         native = self.linear(x)

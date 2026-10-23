@@ -248,3 +248,24 @@ def test_qkv_swap_touches_every_attention_layer(monkeypatch):
     for owner in (*layers, SimpleNamespace()):
         M.ALIGN_SWAPS["qkv"](owner, SimpleNamespace(), None)
     assert seen == [layer.attn.qkv for layer in layers]
+
+
+def test_dense_mlp_swap_touches_dense_layers_only(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.model.minimax_m3.align.dense_mlp")
+
+    class SglM3DenseMLP:
+        @classmethod
+        def swap_in(cls, module):
+            seen.append(module)
+            return module
+
+    fake.SglM3DenseMLP = SglM3DenseMLP
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    dense = SimpleNamespace(mlp=object(), moe=None)
+    moe = SimpleNamespace(mlp=None, moe=object())
+    for owner in (dense, moe, SimpleNamespace()):
+        M.ALIGN_SWAPS["dense_mlp"](owner, SimpleNamespace(), None)
+    assert seen == [dense.mlp]

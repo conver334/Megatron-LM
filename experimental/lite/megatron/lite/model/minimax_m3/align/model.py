@@ -60,9 +60,24 @@ def _swap_qkv(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_o
         SglColumnParallelLinear.swap_in(attn.qkv)
 
 
+def _swap_dense_mlp(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """Dense-layer MLP -> SGLang fused add+norm + DeepGEMM gate_up/down + Triton swigluoai; TE backward."""
+    from megatron.lite.model.minimax_m3.align.dense_mlp import SglM3DenseMLP
+
+    mlp = getattr(owner, "mlp", None)
+    if mlp is not None:
+        SglM3DenseMLP.swap_in(mlp)
+
+
 # name -> swap, applied to every layer and then to the model (final norm / head live there);
 # keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
-ALIGN_SWAPS: dict[str, Swap] = {"rmsnorm": _swap_rmsnorm, "router": _swap_router, "o_proj": _swap_o_proj, "qkv": _swap_qkv}
+ALIGN_SWAPS: dict[str, Swap] = {
+    "rmsnorm": _swap_rmsnorm,
+    "router": _swap_router,
+    "o_proj": _swap_o_proj,
+    "qkv": _swap_qkv,
+    "dense_mlp": _swap_dense_mlp,
+}
 
 
 class MiniMaxM3AlignLayer(MiniMaxM3Layer):
@@ -79,7 +94,7 @@ class MiniMaxM3AlignLayer(MiniMaxM3Layer):
 
     def forward(self, x: torch.Tensor, magi_ctx):
         fused_norms = "rmsnorm" in self.align_modules
-        if not fused_norms and "qkv" not in self.align_modules:
+        if not fused_norms and not ({"qkv", "dense_mlp"} & set(self.align_modules)):
             return super().forward(x, magi_ctx)
         from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm
 
@@ -105,8 +120,14 @@ class MiniMaxM3AlignLayer(MiniMaxM3Layer):
             x = x + delta
             delta = self.moe(self.mlp_norm(x))
         else:
+            if "dense_mlp" in self.align_modules:  # SGLang post_attention_layernorm(attn_out, residual) inside the MLP
+                self.mlp._residual_pair = (delta, x)
             x = x + delta
-            delta = self.mlp(x)
+            try:
+                delta = self.mlp(x)
+            finally:
+                if "dense_mlp" in self.align_modules:
+                    self.mlp._residual_pair = None
         self._residual_pair = (delta, x)  # the next input norm / final norm fuses this add the same way
         return x + delta
 

@@ -120,3 +120,17 @@ class SglGemmaRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _GemmaRMSNormFn.apply(x, self.weight, self.eps)
+
+
+def visible_input_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, pair) -> torch.Tensor:
+    """SGLang ``input_layernorm`` / ``post_attention_layernorm`` bytes for a norm fused into a TE LayerNormLinear:
+    with the (delta, residual) pair the fused add+norm of the fp32 sum, without it the standalone norm of ``x``."""
+    w = weight.detach().to(x.dtype)
+    hidden = x.shape[-1]
+    if pair is None:
+        return gemma_rmsnorm_kernel()(x.reshape(-1, hidden).contiguous(), w, eps).reshape(x.shape)
+    delta, residual = pair
+    hid = delta.detach().reshape(-1, hidden).contiguous().clone()
+    res = residual.detach().reshape(-1, hidden).contiguous().clone()
+    gemma_fused_add_rmsnorm_kernel()(hid, res, w, eps)
+    return hid.reshape(x.shape)

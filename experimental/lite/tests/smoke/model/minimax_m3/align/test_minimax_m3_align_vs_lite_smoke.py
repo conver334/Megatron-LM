@@ -266,3 +266,34 @@ def test_qkv_switch_runs_close_to_lite(magi_cfg, magi_source, dist):
     rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
     assert rel < 1e-2, rel
     print(f"\nqkv switch: loss rel diff vs lite {rel:.2e} (bitwise equal: {torch.equal(lite['loss'], align['loss'])})", flush=True)
+
+
+DENSE_SWITCHES = ("rmsnorm", "qkv", "o_proj", "dense_mlp")
+
+
+def test_all_dense_switches_run_close_to_lite(magi_cfg, magi_source, dist):
+    """rmsnorm + qkv + o_proj + dense_mlp together: the whole dense-layer forward (L0-2 analogue) on SGLang bytes."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.dense_mlp import SglM3DenseMLP
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+
+    _magi_deps()
+    try:
+        deep_gemm_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=DENSE_SWITCHES))
+    chunk = bundle.chunks[0]
+    n_dense = sum(1 for layer in chunk.layers if layer.moe is None)
+    assert sum(isinstance(m, SglM3DenseMLP) for m in chunk.modules()) == n_dense > 0
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=DENSE_SWITCHES))
+    assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
+    rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-2, rel
+    print(f"\nall dense switches {DENSE_SWITCHES}: loss rel diff vs lite {rel:.2e}", flush=True)

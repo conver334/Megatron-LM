@@ -139,3 +139,46 @@ def test_qkv_swap_shows_sglang_norm_and_gemm_bytes_and_keeps_te_backward(with_no
     assert torch.equal(x_sw.grad, x_ref.grad)
     assert torch.equal(sw.linear.weight.grad, ref.linear.weight.grad)
     assert torch.equal(sw.linear.layer_norm_weight.grad, ref.linear.layer_norm_weight.grad)
+
+
+def test_dense_mlp_swap_shows_sglang_bytes_and_keeps_te_backward():
+    from megatron.lite.model.minimax_m3.align.dense_mlp import SglM3DenseMLP
+    from megatron.lite.model.minimax_m3.lite.model import M3DenseMLP
+    from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
+    from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm_kernel, visible_input_norm
+    from megatron.lite.primitive.kernels.sgl_swiglu import swigluoai
+
+    _deepgemm()
+    try:
+        gemma_fused_add_rmsnorm_kernel()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    cfg = SimpleNamespace(hidden_size=H, dense_intermediate_size=1024, rms_norm_eps=1e-6, swiglu_alpha=1.702, swiglu_limit=7.0,
+                          swiglu_up_offset=1.0)
+    torch.manual_seed(4)
+    ref, sw = M3DenseMLP(cfg, _ps()).cuda(), M3DenseMLP(cfg, _ps()).cuda()
+    with torch.no_grad():
+        for m in (ref.gate_up.linear, ref.down.linear):
+            m.weight.normal_(std=0.02)
+        ref.gate_up.linear.layer_norm_weight.normal_(std=0.1)
+        sw.gate_up.linear.weight.copy_(ref.gate_up.linear.weight)
+        sw.gate_up.linear.layer_norm_weight.copy_(ref.gate_up.linear.layer_norm_weight)
+        sw.down.linear.weight.copy_(ref.down.linear.weight)
+    SglM3DenseMLP.swap_in(sw)
+    delta = torch.randn(S, B, H, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(S, B, H, device="cuda", dtype=torch.bfloat16) * 3
+    x = residual + delta
+    sw._residual_pair = (delta, residual)
+    x_ref, x_sw = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+    y_ref, y_sw = ref(x_ref), sw(x_sw)
+    sw._residual_pair = None
+    normed = visible_input_norm(x, sw.gate_up.linear.layer_norm_weight, 1e-6, (delta, residual))
+    want = linear_bf16(swigluoai(linear_bf16(normed, sw.gate_up.linear.weight), 1.702, 7.0), sw.down.linear.weight)
+    assert torch.equal(y_sw, want)
+    print(f"\ndense MLP: SGLang path vs TE path bf16 mismatches {(y_sw != y_ref).sum().item()}/{y_ref.numel()}")
+    g = torch.randn_like(y_ref)
+    y_ref.backward(g)
+    y_sw.backward(g)
+    assert torch.equal(x_sw.grad, x_ref.grad)
+    for a, b in zip(ref.parameters(), sw.parameters()):
+        assert torch.equal(a.grad, b.grad)
