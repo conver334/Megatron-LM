@@ -227,6 +227,26 @@ def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: Mo
                     wrap_offload(submod)
 
 
+_RECOMPUTE_DEPTH = 0
+
+
+class _recomputing_scope:
+    """Marks the re-run of a checkpointed forward; swaps that only decorate the forward bytes can skip their work."""
+
+    def __enter__(self):
+        global _RECOMPUTE_DEPTH
+        _RECOMPUTE_DEPTH += 1
+
+    def __exit__(self, *exc):
+        global _RECOMPUTE_DEPTH
+        _RECOMPUTE_DEPTH -= 1
+        return False
+
+
+def is_recomputing() -> bool:
+    return _RECOMPUTE_DEPTH > 0
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Reentrant activation checkpoint using custom autograd.Function.
 
@@ -277,7 +297,7 @@ class CheckpointFunction(torch.autograd.Function):
             t.detach().requires_grad_(t.requires_grad) if isinstance(t, torch.Tensor) else t
             for t in inputs
         )
-        with torch.enable_grad():
+        with torch.enable_grad(), _recomputing_scope():
             outputs = ctx.run_function(*detached)
 
         # Restore RNG states.

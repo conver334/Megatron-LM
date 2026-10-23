@@ -159,6 +159,9 @@ def test_fused_shared_expert_launch_gives_the_same_routed_bytes():
                             apply_routed_scaling_factor_on_output=True)
     assert torch.equal(i4, i5[:, :K]) and torch.equal(w4, w5[:, :K])
     assert torch.equal(i5[:, K], torch.full((4096,), E, dtype=torch.int32, device="cuda"))
+    # shared slot weight: (routed_sum / rsf) / routed_sum * rsf in the kernel; 1.0 up to fp32 rounding
+    torch.testing.assert_close(w5[:, K], torch.ones(4096, device="cuda"), rtol=1e-6, atol=1e-6)
+    print(f"\nfused shared-slot weight exactly 1.0 on {(w5[:, K] == 1.0).float().mean().item():.4f} of rows")
 
 
 def test_replay_keeps_kernel_bytes_on_unchanged_rows():

@@ -12,6 +12,7 @@ from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
 from megatron.lite.primitive.kernels.sgl_norm import visible_input_norm
 from megatron.lite.primitive.kernels.sgl_swiglu import swigluoai
 from megatron.lite.primitive.kernels.visible import visible_forward
+from megatron.lite.primitive.recompute import is_recomputing
 
 
 class SglM3DenseMLP(M3DenseMLP):
@@ -26,6 +27,8 @@ class SglM3DenseMLP(M3DenseMLP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         native = super().forward(x)
+        if is_recomputing():
+            return native
         with torch.no_grad():
             normed = visible_input_norm(x, self.gate_up.linear.layer_norm_weight, self.gate_up.linear.eps, self._residual_pair)
             act = swigluoai(linear_bf16(normed, self.gate_up.linear.weight), self.config.swiglu_alpha, self.config.swiglu_limit)

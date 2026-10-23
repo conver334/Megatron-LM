@@ -57,7 +57,7 @@ def test_align_layer_rejects_unknown_align_modules(monkeypatch):
         M.MiniMaxM3AlignLayer(SimpleNamespace(), SimpleNamespace(), 0, align_modules=("no_such_module",))
 
 
-def test_align_swaps_are_applied_in_order(monkeypatch):
+def test_align_swaps_are_applied_in_registry_order(monkeypatch):
     from megatron.lite.model.minimax_m3.align import model as M
 
     calls = []
@@ -65,8 +65,10 @@ def test_align_swaps_are_applied_in_order(monkeypatch):
     monkeypatch.setitem(M.ALIGN_SWAPS, "a", lambda layer, cfg, ps, **o: calls.append(("a", o)))
     monkeypatch.setitem(M.ALIGN_SWAPS, "b", lambda layer, cfg, ps, **o: calls.append(("b", o)))
     layer = M._layer_factory(("b", "a"), {"router_gate": "fp32"})(SimpleNamespace(), SimpleNamespace(), 0)
-    assert calls == [("b", {"router_gate": "fp32"}), ("a", {"router_gate": "fp32"})]
+    # registry order, not request order: "router" must be swapped before "experts"
+    assert calls == [("a", {"router_gate": "fp32"}), ("b", {"router_gate": "fp32"})]
     assert layer.align_modules == ("b", "a")
+    assert list(M.ALIGN_SWAPS).index("router") < list(M.ALIGN_SWAPS).index("experts")
 
 
 def test_align_build_model_forwards_lite_cfg_and_align_modules(monkeypatch):
@@ -329,3 +331,59 @@ def test_experts_swap_touches_moe_layers_only(monkeypatch):
     for owner in (moe_layer, SimpleNamespace(moe=None), SimpleNamespace()):
         M.ALIGN_SWAPS["experts"](owner, SimpleNamespace(), None, moe_shared="fused")
     assert seen == [(moe_layer.moe, "fused")]
+
+
+def test_moe_shared_option_reaches_align_opts(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+
+    seen = {}
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self, _cfg, train_cfg, _ps, **kwargs):
+            super().__init__()
+            seen["train_cfg"] = train_cfg
+            self.layers = torch.nn.ModuleList()
+
+        def to(self, *_a, **_k):
+            return self
+
+        def cuda(self, *_a, **_k):
+            return self
+
+    fake = ModuleType("megatron.lite.model.minimax_m3.align.model")
+    fake.MiniMaxM3AlignModel = FakeModel
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    ps = SimpleNamespace(tp_size=1, ep_size=1, etp_size=1, pp_size=1, cp_size=1)
+    monkeypatch.setattr(L, "init_parallel", lambda _cfg: ps)
+    monkeypatch.setattr(L.magi_msa, "validate_device", lambda: None)
+    monkeypatch.setattr(L.magi_msa, "validate_kernel_shapes", lambda **_k: None)
+    monkeypatch.setattr(L.magi_msa, "build_msa_config", lambda *_a, **_k: object())
+    A.build_model(MiniMaxM3Config(), impl_cfg=A.ImplConfig(optimizer=None, align_modules=("router", "experts"), align_moe_shared="fused"))
+    assert seen["train_cfg"].align_opts == {"router_gate": "fp32", "moe_shared": "fused"}
+
+
+def test_experts_swap_in_guards():
+    from megatron.lite.model.minimax_m3.align.moe import SglM3MoELayer
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.modules.router_sgl import SglSigmoidTopKRouter
+
+    def fake_moe(router_cls, ep=1):
+        m = torch.nn.Module()
+        m.dispatcher = SimpleNamespace(ep_size=ep)
+        m.experts = SimpleNamespace(etp_group=None)
+        r = torch.nn.Module()
+        r.gate = torch.nn.Module()
+        r.__class__ = router_cls
+        m.router = r
+        return m
+
+    with pytest.raises(ValueError, match="shared"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), shared="half")
+    with pytest.raises(NotImplementedError, match="ep=1"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter, ep=2))
+    with pytest.raises(NotImplementedError, match="router switch"):
+        SglM3MoELayer.swap_in(fake_moe(SigmoidTopKRouter))
+    m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), shared="separate")
+    assert isinstance(m, SglM3MoELayer) and m.align_moe_shared == "separate"

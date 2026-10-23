@@ -66,10 +66,13 @@ def test_vendored_kernel_text_equals_fork_and_launch_equals_fork_launcher():
 
     install_stubs()
     fork = load("kernels/ops/moe/fused_moe_triton_kernels.py", "sglang.kernels.ops.moe.fused_moe_triton_kernels")
+    import ast
+    import textwrap
+
     for name in ("fused_moe_kernel", "write_zeros_to_output"):
         ours = inspect.getsource(getattr(V, name).fn) if hasattr(getattr(V, name), "fn") else inspect.getsource(getattr(V, name))
         theirs = inspect.getsource(getattr(fork, name).fn) if hasattr(getattr(fork, name), "fn") else inspect.getsource(getattr(fork, name))
-        assert re.sub(r"\s+", " ", ours) == re.sub(r"\s+", " ", theirs), name
+        assert ast.dump(ast.parse(textwrap.dedent(ours))) == ast.dump(ast.parse(textwrap.dedent(theirs))), name  # structure, not text
     x, w13, w2, weights, ids = _inputs(1)
     import triton.language as tl
 
@@ -77,16 +80,16 @@ def test_vendored_kernel_text_equals_fork_and_launch_equals_fork_launcher():
     ours = torch.empty(T * K, 2 * I, dtype=torch.bfloat16, device="cuda")
     theirs = torch.empty_like(ours)
     invoke_fused_moe_kernel_bf16(x, w13, ours, weights, ids, sorted_ids, expert_ids, n_post, False, K)
-    fork.invoke_fused_moe_kernel(
+    fork.invoke_fused_moe_kernel(  # the gate-up launch as SGLang's _fused_moe_kernel_sequence issues it (router_topk default)
         x, w13, None, theirs, None, None, None, weights, ids, sorted_ids, expert_ids, n_post, False, K,
         dict(V.DETERMINISTIC_CONFIG), compute_type=tl.bfloat16, use_fp8_w8a8=False, use_int8_w8a8=False,
-        use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False, block_shape=None, filter_expert=False, router_topk=K,
+        use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False, block_shape=None, filter_expert=(E != E),
     )
     assert torch.equal(ours, theirs)
     act = V.swigluoai(ours, ALPHA, LIMIT)
     ours3 = torch.empty(T, K, H, dtype=torch.bfloat16, device="cuda")
     theirs3 = torch.empty_like(ours3)
-    invoke_fused_moe_kernel_bf16(act, w2, ours3, weights, ids, sorted_ids, expert_ids, n_post, True, 1)
+    invoke_fused_moe_kernel_bf16(act, w2, ours3, weights, ids, sorted_ids, expert_ids, n_post, True, 1, router_topk=K)
     fork.invoke_fused_moe_kernel(
         act, w2, None, theirs3, None, None, None, weights, ids, sorted_ids, expert_ids, n_post, True, 1,
         dict(V.DETERMINISTIC_CONFIG), compute_type=tl.bfloat16, use_fp8_w8a8=False, use_int8_w8a8=False,
@@ -104,3 +107,44 @@ def test_moe_sum_reduce_is_sequential_fp32():
     seq = ((c3[:, 0].float() + c3[:, 1].float()) + c3[:, 2].float()) + c3[:, 3].float()
     assert torch.equal(out, seq.to(torch.bfloat16))
     print(f"\nmoe_sum_reduce vs torch.sum(dim=1): {(out != c3.float().sum(1).to(torch.bfloat16)).sum().item()}/{out.numel()} bf16 mismatches")
+
+
+def test_deterministic_config_matches_fork_default():
+    from megatron.lite.primitive.kernels.sgl_fused_moe import DETERMINISTIC_CONFIG
+    from sglang_fork import install_stubs, load
+
+    install_stubs()
+    cfg_mod = load("srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_config.py", "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config")
+    got = cfg_mod.get_default_config(4096, 128, 2 * 3072, 6144, 4, None, False)
+    assert got == DETERMINISTIC_CONFIG, got
+    assert cfg_mod.get_moe_configs(128, 2 * 3072, None) is None  # deterministic: no tuned (TMA) configs
+
+
+def test_moe_align_block_size_multi_block_and_empty_experts():
+    from megatron.lite.primitive.kernels.sgl_fused_moe import moe_align_block_size
+
+    counts = [0, 5, 1, 70]
+    flat = torch.cat([torch.full((c,), e, dtype=torch.int32) for e, c in enumerate(counts)])
+    topk_ids = flat[torch.randperm(flat.numel(), generator=torch.Generator().manual_seed(0))].view(-1, 4).cuda()
+    for dtype in (torch.int32, torch.int64):
+        sorted_ids, expert_ids, n_post = moe_align_block_size(topk_ids.to(dtype), 64, 4)
+        numel = topk_ids.numel()
+        assert n_post.item() == 64 + 64 + 128 and expert_ids.tolist() == [1, 2, 3, 3]
+        assert (sorted_ids[5:64] == numel).all() and (sorted_ids[:5] != numel).all()
+        assert (topk_ids.reshape(-1)[sorted_ids[:5].long()] == 1).all()
+        assert (sorted_ids[64:65] != numel).all() and (sorted_ids[65:128] == numel).all()
+        assert (sorted_ids[128:198] != numel).all() and (sorted_ids[198:256] == numel).all()
+        assert (topk_ids.reshape(-1)[sorted_ids[128:198].long()] == 3).all()
+
+
+def test_moe_sum_reduce_order_is_observable_with_cancellation():
+    from megatron.lite.primitive.kernels.sgl_fused_moe import moe_sum_reduce
+
+    big = 2.0 ** 25
+    x = torch.tensor([[[big], [1.0], [-big], [1.0]], [[1.0], [big], [1.0], [-big]], [[big], [1.0], [-big], [0.0]]],
+                     device="cuda", dtype=torch.bfloat16)  # [3, K=4, H=1]
+    out = moe_sum_reduce(x)
+    assert out[:, 0].tolist() == [1.0, 0.0, 1.0]  # sequential: ((big+1)-big)+1 = 1; ((1+big)+1)-big = 0
+    assert moe_sum_reduce(x, scale=3.0)[2, 0].item() == 3.0  # scale after the fp32 sum
+    pairwise = ((x[:, 0].float() + x[:, 1].float()) + (x[:, 2].float() + x[:, 3].float())).to(torch.bfloat16)
+    assert not torch.equal(out, pairwise)

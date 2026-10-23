@@ -446,7 +446,7 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: i
 
 
 def invoke_fused_moe_kernel_bf16(A, B, C, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded,
-                                 mul_routed_weight: bool, top_k: int, config: dict = DETERMINISTIC_CONFIG) -> None:
+                                 mul_routed_weight: bool, top_k: int, config: dict = DETERMINISTIC_CONFIG, router_topk: int = 1) -> None:
     """The non-TMA, no-quant launch of ``invoke_fused_moe_kernel`` as SGLang issues it for bf16 under deterministic
     inference (filter_expert False: all experts local)."""
     assert A.dtype == torch.bfloat16 and B.dtype == torch.bfloat16 and C.dtype == torch.bfloat16
@@ -463,7 +463,7 @@ def invoke_fused_moe_kernel_bf16(A, B, C, topk_weights, topk_ids, sorted_token_i
         use_fp8_w8a8=False, use_int8_w8a8=False, use_int8_w8a16=False, per_channel_quant=False,
         even_Ks=(K % config["BLOCK_SIZE_K"] == 0), c_sorted=False, filter_expert=False, swap_ab=False,
         FUSE_ADD_TO_OUTPUT=False, MASK_OUTPUT=False, FUSE_SUM_ALL_REDUCE=False, LORA_PRESERVE_BASE=False,
-        ROUTER_TOPK=topk_ids.shape[1], FUSE_SWIGLU=False,
+        ROUTER_TOPK=router_topk, FUSE_SWIGLU=False,
         **config,
     )
 
@@ -492,5 +492,5 @@ def fused_experts_bf16(hidden: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor
     invoke_fused_moe_kernel_bf16(hidden, w13, cache1, topk_weights, topk_ids, sorted_ids, expert_ids, n_post, False, K)
     cache2 = swigluoai(cache1, alpha, limit)
     cache3 = torch.empty(T, K, w2.shape[1], dtype=hidden.dtype, device=hidden.device)
-    invoke_fused_moe_kernel_bf16(cache2, w2, cache3, topk_weights, topk_ids, sorted_ids, expert_ids, n_post, True, 1)
+    invoke_fused_moe_kernel_bf16(cache2, w2, cache3, topk_weights, topk_ids, sorted_ids, expert_ids, n_post, True, 1, router_topk=K)
     return moe_sum_reduce(cache3, routed_scaling_factor)

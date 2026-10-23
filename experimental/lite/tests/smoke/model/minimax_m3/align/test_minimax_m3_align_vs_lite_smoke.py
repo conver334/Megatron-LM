@@ -365,6 +365,9 @@ def test_recompute_full_with_switches_keeps_every_gradient_and_the_forward_bytes
     plain = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=ALL_SWITCHES))
     rec = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=ALL_SWITCHES, recompute=["full"]))
     assert torch.equal(plain["loss"], rec["loss"]) and torch.equal(plain["log_probs"], rec["log_probs"])
+    from megatron.lite.primitive import recompute as R
+
+    assert not R.is_recomputing()  # the replay scope is balanced
     assert rec["grads"].keys() == plain["grads"].keys(), set(plain["grads"]) ^ set(rec["grads"])
     assert any(k.startswith("layers.0.") for k in rec["grads"]) and any(k.startswith("embed") for k in rec["grads"])
     print(f"\nrecompute=full + all switches: loss/log_probs bitwise equal, {len(rec['grads'])} grads present", flush=True)
@@ -387,12 +390,19 @@ def test_experts_switch_runs_close_to_lite_and_shared_modes_differ(magi_cfg, mag
     seq_lens = BATCHES["packed"]
     moe_io = {}
 
+    moe_mods = {}
+
     def _moe_hooks(tag):
         def install(chunk):
             for i, layer in enumerate(chunk.layers):
                 if layer.moe is not None:
                     layer.moe.register_forward_hook(
                         lambda m, inp, out, i=i: moe_io.__setitem__((tag, i), (inp[0].detach().clone(), out.detach().clone())))
+                    if tag == "align":
+                        moe_mods[i] = layer.moe  # kept alive by this dict for the fp32 reference below
+                        layer.moe.router.register_forward_hook(
+                            lambda m, inp, out: setattr(moe_mods[[k for k, v in moe_mods.items() if v.router is m][0]], "_routing_seen",
+                                                        (out[0].detach().clone(), out[1].detach().clone())))
         return install
 
     lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}),
@@ -412,8 +422,31 @@ def test_experts_switch_runs_close_to_lite_and_shared_modes_differ(magi_cfg, mag
     x_l, y_l = moe_io[("lite", first)]
     x_a, y_a = moe_io[("align", first)]
     assert torch.equal(x_l, x_a), "first MoE layer must see identical inputs (dense layers are lite-identical here)"
+    scale = y_l.float().abs().max().item()
+    torch.testing.assert_close(y_a.float(), y_l.float(), rtol=2 ** -5, atol=2 ** -6 * scale)  # same math, kernel-level rounding only
+    # fp32 reference of the SGLang semantics from the captured routing and the layer's own weights
+    moe = moe_mods[first]
+    scores, ids = moe._routing_seen
+    x2 = x_a.reshape(-1, x_a.shape[-1]).float()
+    cfg = moe.shared_expert.config
+
+    def _swiglu(gu):
+        gate, up = gu.chunk(2, dim=-1)
+        gate = gate.clamp(max=cfg.swiglu_limit)
+        return gate * torch.sigmoid(gate * cfg.swiglu_alpha) * (up.clamp(-cfg.swiglu_limit, cfg.swiglu_limit) + 1)
+
+    ref = torch.zeros_like(x2)
+    for k in range(ids.shape[1]):
+        for e in ids[:, k].unique().tolist():
+            rows = ids[:, k] == e
+            w13 = getattr(moe.experts.fc1, f"weight{e}").float()
+            w2 = getattr(moe.experts.fc2, f"weight{e}").float()
+            ref[rows] += (_swiglu(x2[rows] @ w13.t()) @ w2.t()) * scores[rows, k].float()[:, None]
+    ref += _swiglu(x2 @ moe.shared_expert.gate_up.linear.weight.float().t()) @ moe.shared_expert.down.linear.weight.float().t()
+    torch.testing.assert_close(y_a.reshape(-1, y_a.shape[-1]).float(), ref, rtol=2 ** -5, atol=2 ** -6 * scale)
     print(f"\nfirst MoE layer ({first}) on identical input: SGLang fused-MoE path vs lite dispatcher+TE grouped GEMM: "
-          f"{(y_l != y_a).float().mean().item():.4f} of bf16 outputs differ, max |d| {(y_l.float() - y_a.float()).abs().max().item():.3e}", flush=True)
+          f"{(y_l != y_a).float().mean().item():.4f} of bf16 outputs differ, max |d| {(y_l.float() - y_a.float()).abs().max().item():.3e}; "
+          f"fp32 reference max |d| {(y_a.reshape(-1, y_a.shape[-1]).float() - ref).abs().max().item():.3e}", flush=True)
     assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
     rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
     assert rel < 1e-2, rel

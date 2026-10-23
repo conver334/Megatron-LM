@@ -12,6 +12,7 @@ from megatron.lite.primitive.kernels.sgl_log_softmax import token_logprob
 from megatron.lite.primitive.kernels.visible import visible_forward
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.parallel.linear import VocabParallelOutput
+from megatron.lite.primitive.recompute import is_recomputing
 
 
 class SglVocabParallelOutput(VocabParallelOutput):
@@ -24,6 +25,8 @@ class SglVocabParallelOutput(VocabParallelOutput):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         native = self.col.linear(x)  # first: the owning module's forward pre-hook finishes the DDP param gather
+        if is_recomputing():
+            return native
         return visible_forward(linear_bf16(x, self.col.linear.weight), native)
 
 

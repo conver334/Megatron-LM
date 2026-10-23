@@ -80,6 +80,11 @@ def install_stubs() -> bool:
         "sglang.srt.utils.common", {"get_bool_env_var": _bool_env, "get_dispatch_device_backend": lambda: "CUDA"},
         lambda name: (lambda *a, **k: False))
     _module("sglang.srt.server_args", ServerArgs=object)
+    import types as _types
+    _exec = _types.SimpleNamespace(deterministic=_types.SimpleNamespace(enable_deterministic_inference=True),
+                                   moe=_types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False, ep_num_redundant_experts=0))
+    sys.modules["sglang.srt.runtime_context"] = _AttrModule("sglang.srt.runtime_context", {"get_exec": lambda: _exec}, lambda name: (lambda *a, **k: None))
+    utils._values.update({"get_device_name": lambda: "NVIDIA B200"})
     # fused_moe_triton_kernels.py: quant helpers are never reached for bf16; environment probes as on a CUDA box
     for q in ("sglang.kernels.ops.quantization", "sglang.kernels.ops.quantization.fp8_kernel", "sglang.kernels.ops.quantization.int8_kernel"):
         sys.modules[q] = _AttrModule(q, {}, lambda name: (lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"quant path {name} not under test"))))

@@ -108,8 +108,9 @@ class MiniMaxM3AlignLayer(MiniMaxM3Layer):
         unknown = [m for m in align_modules if m not in ALIGN_SWAPS]
         if unknown:
             raise ValueError(f"minimax_m3 align: unknown align_modules {unknown}; known: {sorted(ALIGN_SWAPS)}")
-        for name in align_modules:
-            ALIGN_SWAPS[name](self, config, ps, **(align_opts or {}))
+        for name in ALIGN_SWAPS:  # registry order: router before experts (the MoE swap needs the SGLang router)
+            if name in align_modules:
+                ALIGN_SWAPS[name](self, config, ps, **(align_opts or {}))
         self.align_modules = tuple(align_modules)
         self._residual_pair = None  # (delta, residual) of this layer's last add; consumed by the next norm site
         self._prev = None  # previous align layer on this stage (set by MiniMaxM3AlignModel)
@@ -151,8 +152,9 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
         align_opts = dict(getattr(train_config, "align_opts", None) or {})
         self.layer_cls = _layer_factory(align_modules, align_opts)
         super().__init__(config, train_config, ps, vpp_chunk_id=vpp_chunk_id)
-        for name in align_modules:
-            ALIGN_SWAPS[name](self, config, ps, **align_opts)
+        for name in ALIGN_SWAPS:
+            if name in align_modules:
+                ALIGN_SWAPS[name](self, config, ps, **align_opts)
         self.align_modules = align_modules
         for prev, layer in zip(self.layers, list(self.layers)[1:]):
             object.__setattr__(layer, "_prev", prev)  # plain reference, not a registered submodule

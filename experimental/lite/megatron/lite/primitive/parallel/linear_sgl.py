@@ -10,6 +10,7 @@ import torch
 from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
 from megatron.lite.primitive.kernels.visible import visible_forward
 from megatron.lite.primitive.parallel.linear import ColumnParallelLinear, RowParallelLinear
+from megatron.lite.primitive.recompute import is_recomputing
 
 
 class SglRowParallelLinear(RowParallelLinear):
@@ -22,6 +23,8 @@ class SglRowParallelLinear(RowParallelLinear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         native = self.linear(x)
+        if is_recomputing():
+            return native
         return visible_forward(linear_bf16(x, self.linear.weight), native)
 
 
@@ -47,6 +50,8 @@ class SglColumnParallelLinear(ColumnParallelLinear):
 
     def forward(self, x: torch.Tensor):
         native = self.linear(x)
+        if is_recomputing():
+            return native
         norm_native = None
         if self.return_layernorm_output:
             native, norm_native = native
