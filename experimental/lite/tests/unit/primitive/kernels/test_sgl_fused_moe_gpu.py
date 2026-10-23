@@ -159,16 +159,20 @@ def _m3_fork_kwargs():
                 gate_up_interleaved=False, apply_router_weight_on_input=False, routed_scaling_factor=None, filter_expert=False)
 
 
-@pytest.mark.parametrize("shape", ["unit", "model_width"])
+@pytest.mark.parametrize("shape", ["unit", "unit_k1", "unit_k2", "model_width"])
 def test_whole_layer_equals_fork_fused_experts_impl(shape):
     """mlite fused_experts_bf16 == the fork's fused_experts_impl (its own orchestration, config resolution, caches,
-    swiglu dispatch and Triton sum) run by path on the same input: the EP=1 MoE contract, no tolerance."""
+    swiglu dispatch and Triton sum, the K=1 / K=2 combine special cases) run by path on the same input: the EP=1 MoE
+    contract, no tolerance."""
     from megatron.lite.primitive.kernels.sgl_fused_moe import fused_experts_bf16
     from sglang_fork import load_fork_fused_moe
 
     fm = load_fork_fused_moe()
-    if shape == "unit":
+    if shape.startswith("unit"):
         x, w13, w2, weights, ids = _inputs(5)
+        if shape != "unit":  # fork: K=1 writes the down GEMM straight into the output, K=2 is one bf16 add
+            k = int(shape[-1])
+            weights, ids = weights[:, :k].contiguous(), ids[:, :k].contiguous()
     else:  # real hidden / intermediate width, a slice of the experts
         from megatron.lite.primitive.kernels.sgl_moe_fused_gate import moe_fused_gate
 
@@ -188,6 +192,7 @@ def test_whole_layer_equals_fork_fused_experts_impl(shape):
 def test_gemm_bytes_do_not_depend_on_token_order_within_expert_blocks():
     """moe_align_block_size is layout only: permuting the token order inside each expert's run leaves every
     kernel output byte unchanged, so the torch layout stands in for the CUDA/JIT kernels' order."""
+    from megatron.lite.primitive.kernels import sgl_fused_moe as V
     from megatron.lite.primitive.kernels.sgl_fused_moe import DETERMINISTIC_CONFIG, invoke_fused_moe_kernel_bf16, moe_align_block_size
 
     x, w13, w2, weights, ids = _inputs(8)
@@ -207,8 +212,10 @@ def test_gemm_bytes_do_not_depend_on_token_order_within_expert_blocks():
     for layout in (sorted_ids, shuffled):
         c1 = torch.empty(T * K, 2 * I, dtype=torch.bfloat16, device="cuda")
         invoke_fused_moe_kernel_bf16(x, w13, c1, weights, ids, layout, expert_ids, n_post, False, K)
-        outs.append(c1)
-    assert torch.equal(outs[0], outs[1])
+        c3 = torch.empty(T, K, H, dtype=torch.bfloat16, device="cuda")
+        invoke_fused_moe_kernel_bf16(V.swigluoai(c1, ALPHA, LIMIT), w2, c3, weights, ids, layout, expert_ids, n_post, True, 1, router_topk=K)
+        outs.append((c1, c3))
+    assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
 
 
 def test_moe_sum_reduce_starts_from_positive_zero():
@@ -251,6 +258,29 @@ def test_combine_modes_reference_semantics_and_observability():
         ref[t] = acc.to(torch.bfloat16)
     assert torch.equal(combine_slots(c3, ids, "ep_normal", num_experts=E, ep_size=ep), ref)
     assert torch.equal(combine_slots(c3, ids, "ep_normal", num_experts=E, ep_size=1), slot)  # one rank == EP=1 sum
+    # 16 ranks = 2 DeepEP nodes: node sums rounded to bf16 (NVL forwarder), nodes added in fp32 (RDMA receiver)
+    ref = torch.empty_like(slot)
+    for t in range(T):
+        acc = torch.zeros(H, device="cuda")
+        for node in range(2):
+            node_acc = torch.zeros(H, device="cuda")
+            for r in range(node * 8, node * 8 + 8):
+                on_r = [k for k in range(K) if ids[t, k].item() == r]  # E == 16 ranks: one expert per rank
+                if not on_r:
+                    continue
+                part = torch.zeros(H, device="cuda")
+                for k in range(K):
+                    part = part + (c3[t, k].float() if k in on_r else torch.zeros(H, device="cuda"))
+                node_acc = node_acc + part.to(torch.bfloat16).float()
+            if any(ids[t, k].item() // 8 == node for k in range(K)):
+                acc = acc + node_acc.to(torch.bfloat16).float()
+        ref[t] = acc.to(torch.bfloat16)
+    assert torch.equal(combine_slots(c3, ids, "ep_normal", num_experts=E, ep_size=16), ref)
+    # slot mode special cases as the fork: K=1 is the GEMM output itself, K=2 one bf16 add (both keep -0.0)
+    neg = torch.full((2, 1, 3), -0.0, device="cuda", dtype=torch.bfloat16)
+    assert (combine_slots(neg, ids[:2, :1], "slot").view(torch.int16) == -32768).all()
+    assert (combine_slots(neg.expand(2, 2, 3).contiguous(), ids[:2, :2], "slot").view(torch.int16) == -32768).all()
+    assert (combine_slots(neg.expand(2, 3, 3).contiguous(), ids[:2, :3], "slot").view(torch.int16) == 0).all()
     # the modes are observable: cancellation makes the slot order matter, bf16 partials make the rank grouping matter
     big = 2.0 ** 25
     xa = torch.tensor([[[big], [1.0], [-big], [1.0]]], device="cuda", dtype=torch.bfloat16)
@@ -261,5 +291,9 @@ def test_combine_modes_reference_semantics_and_observability():
     ib = torch.tensor([[0, 1, 8, 12]], device="cuda", dtype=torch.int32)  # ranks 0, 0, 2, 3 of 4
     assert combine_slots(xb, ib, "slot").item() == 2.0 ** -9
     assert combine_slots(xb, ib, "ep_normal", num_experts=E, ep_size=4).item() == 0.0  # rank-0 partial 1 + 2^-9 rounds to 1.0 in bf16
+    xc = torch.tensor([[[1.0], [2.0 ** -9], [2.0 ** -9], [2.0 ** -9]]], device="cuda", dtype=torch.bfloat16)
+    ic = torch.tensor([[0, 1, 2, 8]], device="cuda", dtype=torch.int32)  # 16 ranks: node 0 holds three slots, node 1 one
+    assert combine_slots(xc, ic, "slot").item() == 1.0 + 2.0 ** -7  # flat fp32 sum 1 + 3*2^-9 rounds up
+    assert combine_slots(xc, ic, "ep_normal", num_experts=E, ep_size=16).item() == 1.0  # node-0 bf16 partial 1 + 2^-8 -> 1.0, + 2^-9 -> 1.0
     for m in COMBINE_MODES:
         assert combine_slots(c3, ids, m, num_experts=E, ep_size=ep).shape == (T, H)

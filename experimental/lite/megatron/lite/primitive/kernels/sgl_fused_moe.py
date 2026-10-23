@@ -469,6 +469,7 @@ def invoke_fused_moe_kernel_bf16(A, B, C, topk_weights, topk_ids, sorted_token_i
 
 
 COMBINE_MODES = ("slot", "expert_asc", "ep_normal")
+RANKS_PER_NODE = 8  # DeepEP NUM_MAX_NVL_PEERS: ranks beyond one node combine in two stages
 
 
 def moe_sum_reduce(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
@@ -484,13 +485,21 @@ def moe_sum_reduce(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
 
 def combine_slots(cache3: torch.Tensor, topk_ids: torch.Tensor, mode: str = "slot", *, num_experts: int | None = None,
                   ep_size: int = 1, scale: float = 1.0) -> torch.Tensor:
-    """[T, K, H] slot outputs (routed weights applied) -> [T, H] bf16 in a declared accumulation order.
-    slot: SGLang EP=1 Triton runner (moe_sum_reduce, slot order).
+    """[T, K, H] slot outputs (routed weights applied in the down GEMM) -> [T, H] bf16 in a declared accumulation order.
+    slot: SGLang EP=1 Triton runner (K=1 written by the GEMM, K=2 one bf16 add, else moe_sum_reduce in slot order).
     expert_asc: slots summed in ascending expert id (the EP accumulation-order contract candidate).
-    ep_normal: DeepEP normal-mode combine shape: each of ``ep_size`` ranks (experts in contiguous blocks) sums its
-    slots in slot order with remote slots as zeros to a bf16 partial, the ranks holding a slot are added in
-    ascending rank order in fp32 and rounded once more."""
+    ep_normal: DeepEP normal-mode combine shape over ``ep_size`` ranks (experts in contiguous blocks): per rank a bf16
+    partial of its slots in slot order with remote slots as zeros, ranks holding a slot added in ascending rank order in
+    fp32 and rounded (intranode, <= 8 ranks); with more ranks each 8-rank node's sum is rounded to bf16 first and the
+    nodes are added in fp32 (internode). The per-rank partial is the Triton-runner shape; the fork's own DeepEP path
+    (DeepGEMM runner + ep_gather) weights the bf16 expert output after rounding, so only the cross-rank part has a
+    fork counterpart."""
+    K = cache3.shape[1]
     if mode == "slot":
+        if K == 1 and scale == 1.0:
+            return cache3[:, 0].clone()
+        if K == 2 and scale == 1.0:
+            return cache3[:, 0] + cache3[:, 1]
         return moe_sum_reduce(cache3, scale)
     ids = topk_ids.to(torch.int64)
     if mode == "expert_asc":
@@ -501,11 +510,18 @@ def combine_slots(cache3: torch.Tensor, topk_ids: torch.Tensor, mode: str = "slo
             raise ValueError(f"ep_normal needs num_experts divisible by ep_size, got {num_experts} / {ep_size}")
         ranks = ids // (num_experts // ep_size)
         zero = torch.zeros((), dtype=cache3.dtype, device=cache3.device)
+        n_nodes = (ep_size + RANKS_PER_NODE - 1) // RANKS_PER_NODE
         acc = torch.zeros(cache3.shape[0], cache3.shape[2], dtype=torch.float32, device=cache3.device)
-        for r in range(ep_size):
-            on_r = ranks == r
-            partial = moe_sum_reduce(torch.where(on_r[:, :, None], cache3, zero), scale)
-            acc = torch.where(on_r.any(dim=1)[:, None], acc + partial.float(), acc)
+        for node in range(n_nodes):
+            node_acc = torch.zeros_like(acc)
+            for r in range(node * RANKS_PER_NODE, min((node + 1) * RANKS_PER_NODE, ep_size)):
+                on_r = ranks == r
+                partial = moe_sum_reduce(torch.where(on_r[:, :, None], cache3, zero), scale)
+                node_acc = torch.where(on_r.any(dim=1)[:, None], node_acc + partial.float(), node_acc)
+            if n_nodes == 1:
+                return node_acc.to(cache3.dtype)
+            on_node = (ranks // RANKS_PER_NODE == node).any(dim=1)[:, None]
+            acc = torch.where(on_node, acc + node_acc.to(cache3.dtype).float(), acc)
         return acc.to(cache3.dtype)
     raise ValueError(f"combine mode {mode!r}; known: {COMBINE_MODES}")
 
