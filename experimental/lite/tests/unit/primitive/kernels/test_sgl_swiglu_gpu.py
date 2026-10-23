@@ -52,3 +52,14 @@ def test_swigluoai_vs_sglang_compiled_and_mlite_quick_geglu():
     torch.testing.assert_close(ours.float(), compiled.float(), rtol=1e-2, atol=1e-2)
     print(f"\nswigluoai Triton vs SGLang torch.compile (this torch): {(ours != compiled).sum().item()}/{ours.numel()} bf16 mismatches; "
           f"vs mlite quick_geglu: {(ours != mlite).sum().item()}/{ours.numel()}", flush=True)
+
+
+def test_swigluoai_equals_fork_kernel_by_path():
+    from megatron.lite.primitive.kernels.sgl_swiglu import swigluoai
+    from sglang_fork import install_stubs, load
+
+    install_stubs()
+    fork = load("kernels/ops/activation/swigluoai_triton.py", "sglang.kernels.ops.activation.swigluoai_triton")
+    torch.manual_seed(2)
+    x = torch.randn(4096, 2 * 3072, device="cuda", dtype=torch.bfloat16) * 4
+    assert torch.equal(swigluoai(x, ALPHA, LIMIT), fork.swigluoai(x, ALPHA, LIMIT))

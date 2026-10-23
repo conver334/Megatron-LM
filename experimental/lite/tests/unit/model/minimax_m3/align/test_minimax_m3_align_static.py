@@ -291,3 +291,21 @@ def test_lm_head_swap_touches_the_model_head_only(monkeypatch):
         M.ALIGN_SWAPS["lm_head"](owner, SimpleNamespace(), None)
     assert seen == [model.head]
     assert "self._token_loss(" in __import__("inspect").getsource(__import__("megatron.lite.model.minimax_m3.lite.model", fromlist=["x"]).MiniMaxM3Model.forward)
+
+
+def test_prev_links_are_plain_references_not_submodules():
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    a, b = torch.nn.Module(), torch.nn.Module()
+    object.__setattr__(b, "_prev", a)  # the pattern MiniMaxM3AlignModel uses
+    assert b._prev is a and "_prev" not in b._modules and len(list(b.children())) == 0
+    assert 'object.__setattr__(layer, "_prev", prev)' in __import__("inspect").getsource(M.MiniMaxM3AlignModel.__init__)
+
+
+def test_qkv_switch_refuses_pipeline_parallel():
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
+    from megatron.lite.runtime.contracts import ParallelConfig
+
+    with pytest.raises(NotImplementedError, match="pipeline"):
+        A.build_model(MiniMaxM3Config(), impl_cfg=A.ImplConfig(parallel=ParallelConfig(pp=2), optimizer=None, align_modules=("qkv",)))

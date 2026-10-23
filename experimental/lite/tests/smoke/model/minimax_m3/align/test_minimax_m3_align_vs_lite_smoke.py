@@ -47,7 +47,7 @@ def _impl_cfg(proto, **kw):
                             magi_chunk_size=CHUNK, **kw)
 
 
-def _run(proto, cfg, src, seq_lens, impl_cfg, *, pre_roll=False):
+def _run(proto, cfg, src, seq_lens, impl_cfg, *, pre_roll=False, hooks=None):
     from megatron.lite.model.minimax_m3.align.protocol import roll_packed_labels
     from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -55,6 +55,8 @@ def _run(proto, cfg, src, seq_lens, impl_cfg, *, pre_roll=False):
     bundle = proto.build_model(cfg, impl_cfg=impl_cfg)
     chunk = bundle.chunks[0]
     proto.load_hf_weights(chunk, src, cfg, bundle.parallel_state)
+    if hooks is not None:
+        hooks(chunk)
     routing = {}
     for i, layer in enumerate(chunk.layers):
         if layer.moe is not None:
@@ -259,9 +261,27 @@ def test_qkv_switch_runs_close_to_lite(magi_cfg, magi_source, dist):
     chunk = bundle.chunks[0]
     assert sum(isinstance(m, SglColumnParallelLinear) for m in chunk.modules()) == len(chunk.layers)
     assert all(layer._prev is prev for prev, layer in zip(chunk.layers, list(chunk.layers)[1:]))
+    assert all("_prev" not in layer._modules for layer in chunk.layers)
     del bundle, chunk
     torch.cuda.empty_cache()
-    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rmsnorm", "qkv")))
+    # pair handoff: layer 0 sees no pair, every later layer sees its predecessor's (delta, residual) and its QKV
+    # bytes are the fused add+norm of that pair through DeepGEMM
+    from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
+    from megatron.lite.primitive.kernels.sgl_norm import visible_input_norm
+
+    seen = {}
+
+    def _hooks(chunk):
+        for i, layer in enumerate(chunk.layers):
+            def pre(m, inp, i=i):
+                seen[("pair", i)] = None if m._residual_pair is None else tuple(t.detach().clone() for t in m._residual_pair)
+            layer.attn.qkv.register_forward_pre_hook(pre)
+            layer.attn.qkv.register_forward_hook(lambda m, inp, out, i=i: seen.__setitem__(("qkv", i), (out[0] if isinstance(out, tuple) else out).detach().clone()))
+
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rmsnorm", "qkv")), hooks=_hooks)
+    n_layers = max(i for (_, i) in seen) + 1
+    assert seen[("pair", 0)] is None and all(seen[("pair", i)] is not None for i in range(1, n_layers))
+    assert torch.isfinite(align["loss"]).all()
     assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
     rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
     assert rel < 1e-2, rel
@@ -328,3 +348,23 @@ def test_all_switches_run_and_report_token_logprob_delta(magi_cfg, magi_source, 
     lp_l, lp_a = lite["log_probs"], align["log_probs"]
     print(f"\nall switches {ALL_SWITCHES}: loss rel diff vs lite {rel:.2e}; token log_probs differ on "
           f"{(lp_l != lp_a).float().mean().item():.4f} of tokens, max |d| {(lp_l - lp_a).abs().max().item():.2e}", flush=True)
+
+
+def test_recompute_full_with_switches_keeps_every_gradient_and_the_forward_bytes(magi_cfg, magi_source, dist):
+    """recompute=["full"] re-runs the layer forward inside a checkpoint: all switches must still give every parameter a
+    gradient (the final norm/head gradient flows through h) and the loss must be bitwise the non-recompute run."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+
+    _magi_deps()
+    try:
+        deep_gemm_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    plain = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=ALL_SWITCHES))
+    rec = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=ALL_SWITCHES, recompute=["full"]))
+    assert torch.equal(plain["loss"], rec["loss"]) and torch.equal(plain["log_probs"], rec["log_probs"])
+    assert rec["grads"].keys() == plain["grads"].keys(), set(plain["grads"]) ^ set(rec["grads"])
+    assert any(k.startswith("layers.0.") for k in rec["grads"]) and any(k.startswith("embed") for k in rec["grads"])
+    print(f"\nrecompute=full + all switches: loss/log_probs bitwise equal, {len(rec['grads'])} grads present", flush=True)

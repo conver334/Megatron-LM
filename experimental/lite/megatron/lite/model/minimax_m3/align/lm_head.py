@@ -23,12 +23,13 @@ class SglVocabParallelOutput(VocabParallelOutput):
         return module
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return visible_forward(linear_bf16(x, self.col.linear.weight), self.col.linear(x))
+        native = self.col.linear(x)  # first: the owning module's forward pre-hook finishes the DDP param gather
+        return visible_forward(linear_bf16(x, self.col.linear.weight), native)
 
 
 def sgl_token_loss(logits: torch.Tensor, labels_sb: torch.Tensor, tp_group) -> torch.Tensor:
     """-logprob[label] with SGLang bytes (logits.float() -> BI log_softmax), gradient of the native CE."""
     native = vocab_parallel_cross_entropy(logits, labels_sb, tp_group)
     with torch.no_grad():
-        visible = -token_logprob(logits.detach().float(), labels_sb)
+        visible = -token_logprob(logits.detach(), labels_sb)  # bf16 logits upcast inside the kernel
     return visible_forward(visible, native)

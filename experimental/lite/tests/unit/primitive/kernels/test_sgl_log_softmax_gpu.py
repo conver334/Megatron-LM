@@ -15,11 +15,13 @@ def test_stats_twin_matches_full_kernel_and_torch_within_tolerance():
     from megatron.lite.primitive.kernels.sgl_log_softmax import log_softmax, token_logprob
 
     torch.manual_seed(0)
-    x = (torch.randn(64, V, device="cuda", dtype=torch.bfloat16) * 4).float()
+    x_bf16 = torch.randn(64, V, device="cuda", dtype=torch.bfloat16) * 4
+    x = x_bf16.float()  # SGLang: logits.float() then the BI kernel
     labels = torch.randint(0, V, (64,), device="cuda")
     full = torch.gather(log_softmax(x), 1, labels[:, None]).squeeze(1)
     ours = token_logprob(x, labels)
     assert torch.equal(ours, full)
+    assert torch.equal(token_logprob(x_bf16, labels), full)  # bf16 logits upcast in-kernel: no fp32 copy needed
     ref = torch.gather(torch.log_softmax(x, -1), 1, labels[:, None]).squeeze(1)
     torch.testing.assert_close(ours, ref, rtol=1e-5, atol=1e-5)
     print(f"\nBI log_softmax vs torch.log_softmax at the label: {(ours != ref).sum().item()}/{ours.numel()} fp32 mismatches")

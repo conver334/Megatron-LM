@@ -13,6 +13,8 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 
+from megatron.lite.primitive.kernels.visible import visible_forward
+
 from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
 from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Layer, MiniMaxM3Model
 from megatron.lite.primitive.parallel import ParallelState
@@ -103,41 +105,32 @@ class MiniMaxM3AlignLayer(MiniMaxM3Layer):
         self._prev = None  # previous align layer on this stage (set by MiniMaxM3AlignModel)
 
     def forward(self, x: torch.Tensor, magi_ctx):
+        """lite's layer with SGLang's norm sites: every norm that follows a residual add sees the fp32 sum of the
+        (delta, residual) pair (kernel bytes) while the native TE/torch path of the bf16 sum carries the gradient.
+        Pairs are plain attributes that stay set until the next forward, so activation recompute replays them."""
         fused_norms = "rmsnorm" in self.align_modules
         if not fused_norms and not ({"qkv", "dense_mlp"} & set(self.align_modules)):
             return super().forward(x, magi_ctx)
-        from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm
+        from megatron.lite.primitive.kernels.sgl_norm import visible_input_norm
 
         if "qkv" in self.align_modules:  # SGLang input_layernorm(prev_out, residual) inside the swapped qkv
             self.attn.qkv._residual_pair = self._prev._residual_pair if self._prev is not None else None
-        try:
-            if self.is_sparse_attention:
-                delta = self.attn(x, magi_ctx=magi_ctx)
-            else:
-                delta = self.attn(
-                    x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
-                )
-        finally:
-            if "qkv" in self.align_modules:
-                self.attn.qkv._residual_pair = None
-        if self._prev is not None:
-            self._prev._residual_pair = None
-        if self.moe is not None and fused_norms:
-            # SGLang post_attention_layernorm(attn_out, residual): norm of the fp32 sum, residual <- bf16 sum
-            normed, x = gemma_fused_add_rmsnorm(delta, x, self.mlp_norm.weight, self.mlp_norm.eps)
+        if self.is_sparse_attention:
+            delta = self.attn(x, magi_ctx=magi_ctx)
+        else:
+            delta = self.attn(
+                x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
+            )
+        pair = (delta, x)
+        x = x + delta  # bf16 sum == the residual the fused kernel writes back
+        if self.moe is not None:
+            native = self.mlp_norm(x)  # module call: DDP param-gather pre-hook, TE/standalone backward
+            normed = visible_forward(visible_input_norm(x, self.mlp_norm.weight, self.mlp_norm.eps, pair), native) if fused_norms else native
             delta = self.moe(normed)
-        elif self.moe is not None:
-            x = x + delta
-            delta = self.moe(self.mlp_norm(x))
         else:
             if "dense_mlp" in self.align_modules:  # SGLang post_attention_layernorm(attn_out, residual) inside the MLP
-                self.mlp._residual_pair = (delta, x)
-            x = x + delta
-            try:
-                delta = self.mlp(x)
-            finally:
-                if "dense_mlp" in self.align_modules:
-                    self.mlp._residual_pair = None
+                self.mlp._residual_pair = pair
+            delta = self.mlp(x)
         self._residual_pair = (delta, x)  # the next input norm / final norm fuses this add the same way
         return x + delta
 
@@ -152,7 +145,16 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
             ALIGN_SWAPS[name](self, config, ps, **align_opts)
         self.align_modules = align_modules
         for prev, layer in zip(self.layers, list(self.layers)[1:]):
-            layer._prev = prev
+            object.__setattr__(layer, "_prev", prev)  # plain reference, not a registered submodule
+
+    def forward(self, *args, **kwargs) -> dict:
+        for layer in self.layers:  # drop last step's pairs now; they must survive backward/recompute of that step
+            layer._residual_pair = None
+            for name in ("qkv", "dense_mlp"):
+                owner = layer.attn.qkv if name == "qkv" else layer.mlp
+                if name in self.align_modules and owner is not None:
+                    owner._residual_pair = None
+        return super().forward(*args, **kwargs)
 
     def _token_loss(self, logits: torch.Tensor, labels_sb: torch.Tensor) -> torch.Tensor:
         if "lm_head" not in self.align_modules:
@@ -162,19 +164,9 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
         return sgl_token_loss(logits, labels_sb, self.ps.tp_group)
 
     def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
+        native = self.norm(h)  # module call (DDP pre-hook); gradient of lite's norm of the bf16 sum
         if "rmsnorm" not in self.align_modules:
-            return super()._final_norm(h)
-        from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm
+            return native
+        from megatron.lite.primitive.kernels.sgl_norm import visible_input_norm
 
-        last = self.layers[-1]
-        delta, residual = last._residual_pair  # SGLang model.norm(hidden, residual)
-        last._residual_pair = None
-        normed, _ = gemma_fused_add_rmsnorm(delta, residual, self.norm.weight, self.norm.eps)
-        return normed
-
-
-def _layer_factory(align_modules: tuple[str, ...], align_opts: dict | None = None):
-    def make(config, ps, layer_idx, **kwargs) -> nn.Module:
-        return MiniMaxM3AlignLayer(config, ps, layer_idx, align_modules=align_modules, align_opts=align_opts, **kwargs)
-
-    return make
+        return visible_forward(visible_input_norm(h, self.norm.weight, self.norm.eps, self.layers[-1]._residual_pair), native)

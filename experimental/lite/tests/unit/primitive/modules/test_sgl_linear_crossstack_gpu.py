@@ -50,3 +50,10 @@ def test_fork_mm_override_equals_mlite_linear_bf16(name):
     cublas = torch.mm(x_all, w.t())  # what lite's TE/cuBLAS forward produces today (same bf16-in, bf16-out contract)
     print(f"\n{name} [{k}->{n}]: fork mm override == mlite linear_bf16 and M-invariant for M in {ROWS}; "
           f"vs cuBLAS bf16 GEMM: {(full != cublas).float().mean().item():.4f} of outputs differ", flush=True)
+
+
+def test_fork_batch_invariant_mode_turns_on_deep_gemm_deterministic_algorithms():
+    import inspect
+
+    bi = _fork_bi()
+    assert "use_deterministic_algorithms(True)" in inspect.getsource(bi.enable_batch_invariant_mode)

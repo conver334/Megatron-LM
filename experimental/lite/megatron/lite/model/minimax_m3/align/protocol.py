@@ -101,6 +101,8 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     from megatron.lite.model.minimax_m3.align.model import MiniMaxM3AlignModel
 
+    if "qkv" in impl_cfg.align_modules and (impl_cfg.parallel.pp > 1 or impl_cfg.parallel.vpp > 1):
+        raise NotImplementedError("align qkv: the residual pair is not carried across pipeline stages yet (pp=1, vpp=1)")
     bundle = _lite.build_model(
         model_cfg,
         impl_cfg=to_lite_impl_cfg(impl_cfg),
