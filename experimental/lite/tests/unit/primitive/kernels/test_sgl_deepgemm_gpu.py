@@ -50,3 +50,20 @@ def test_split_gemm_is_batch_invariant_and_reproducible():
     assert all(v == 0 for v in report.values()), report
     tail = bf16xfp32_gemm(x[4000:], w)
     assert torch.equal(tail, full[4000:])
+
+
+def test_linear_bf16_matches_nt_form_and_is_batch_invariant():
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module, linear_bf16
+
+    dg = _dg()
+    torch.manual_seed(2)
+    w = (torch.randn(8192, H, device="cuda") * 0.02).to(torch.bfloat16)
+    x = torch.randn(4096, H, device="cuda", dtype=torch.bfloat16)
+    full = linear_bf16(x, w)
+    nt = torch.empty_like(full)
+    dg.bf16_gemm_nt(x, w, nt)
+    print(f"\nbf16 out: NN(W.t() view) vs NT mismatches {(full != nt).sum().item()}/{full.numel()}")
+    report = {n: (linear_bf16(x[:n], w) != full[:n]).sum().item() for n in (1, 8, 37, 512, 2048)}
+    print(f"linear_bf16 batch invariance: {report}")
+    assert all(v == 0 for v in report.values()), report
+    assert torch.equal(full, linear_bf16(x, w))

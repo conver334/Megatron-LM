@@ -206,3 +206,32 @@ def test_router_switch_matches_lite_routing_and_is_visible(magi_cfg, magi_source
     assert not torch.equal(lite["loss"], bf16["loss"]), "bf16 gate switch had no visible effect"
     print(f"\nrouter switch: {n_sgl} routers swapped, loss rel diff vs lite fp32 gate {rel:.2e}, "
           f"bf16 gate {((lite['loss'] - bf16['loss']).abs() / lite['loss'].abs()).item():.2e}", flush=True)
+
+
+def test_o_proj_switch_runs_close_to_lite_and_is_visible(magi_cfg, magi_source, dist):
+    """align_modules=("o_proj",): every attention output projection shows DeepGEMM bytes; TE backward unchanged."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+    from megatron.lite.primitive.parallel.linear_sgl import SglRowParallelLinear
+
+    _magi_deps()
+    try:
+        deep_gemm_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("o_proj",)))
+    chunk = bundle.chunks[0]
+    n_sgl = sum(isinstance(m, SglRowParallelLinear) for m in chunk.modules())
+    assert n_sgl == len(chunk.layers), (n_sgl, len(chunk.layers))
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("o_proj",)))
+    assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
+    rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-2, rel
+    assert not torch.equal(lite["loss"], align["loss"]), "o_proj switch had no visible effect"
+    print(f"\no_proj switch: {n_sgl} projections swapped, loss rel diff vs lite {rel:.2e}", flush=True)

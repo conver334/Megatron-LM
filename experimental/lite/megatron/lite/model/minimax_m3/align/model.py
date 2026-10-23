@@ -42,9 +42,18 @@ def _swap_router(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *
         SglSigmoidTopKRouter.swap_in(moe.router, gate=router_gate)
 
 
+def _swap_o_proj(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """Attention output projection -> SGLang batch-invariant bf16 GEMM (DeepGEMM) forward, TE backward."""
+    from megatron.lite.primitive.parallel.linear_sgl import SglRowParallelLinear
+
+    attn = getattr(owner, "attn", None)
+    if attn is not None:
+        SglRowParallelLinear.swap_in(attn.proj)
+
+
 # name -> swap, applied to every layer and then to the model (final norm / head live there);
 # keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
-ALIGN_SWAPS: dict[str, Swap] = {"rmsnorm": _swap_rmsnorm, "router": _swap_router}
+ALIGN_SWAPS: dict[str, Swap] = {"rmsnorm": _swap_rmsnorm, "router": _swap_router, "o_proj": _swap_o_proj}
 
 
 class MiniMaxM3AlignLayer(MiniMaxM3Layer):

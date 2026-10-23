@@ -40,6 +40,15 @@ def bf16_gemm_f32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def linear_bf16(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """SGLang batch-invariant ``F.linear`` for bf16 weights: ``aten::mm`` -> ``matmul_persistent`` ->
+    ``deep_gemm.bf16_gemm_nn(x, W.t(), out_bf16)``. Same call form here (NN with the transposed-weight view)."""
+    x2 = x.reshape(-1, x.shape[-1]).contiguous()
+    out = torch.empty(x2.shape[0], w.shape[0], dtype=x2.dtype, device=x2.device)
+    deep_gemm_module().bf16_gemm_nn(x2, w.contiguous().t(), out)
+    return out.reshape(*x.shape[:-1], w.shape[0])
+
+
 def bf16xfp32_gemm(x: torch.Tensor, w_fp32: torch.Tensor) -> torch.Tensor:
     """x bf16 @ w_fp32.T with the bf16 high/low split; identical on the SGLang side (algo ``deep_gemm``)."""
     w_high, w_low = split_fp32_weight(w_fp32)

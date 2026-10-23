@@ -207,3 +207,24 @@ def test_swapped_attribute_names_exist_in_lite_source():
     assert "self.norm" in inspect.getsource(LM.MiniMaxM3Model.__init__)
     assert "self._final_norm(" in inspect.getsource(LM.MiniMaxM3Model.forward)
     assert "self.router" in inspect.getsource(LM.M3MoELayer.__init__)
+
+
+def test_o_proj_swap_touches_every_attention_layer(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.primitive.parallel.linear_sgl")
+
+    class SglRowParallelLinear:
+        @classmethod
+        def swap_in(cls, module):
+            seen.append(module)
+            return module
+
+    fake.SglRowParallelLinear = SglRowParallelLinear
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    layers = [SimpleNamespace(attn=SimpleNamespace(proj=object())) for _ in range(3)]
+    model = SimpleNamespace()
+    for owner in (*layers, model):
+        M.ALIGN_SWAPS["o_proj"](owner, SimpleNamespace(), None)
+    assert seen == [layer.attn.proj for layer in layers]

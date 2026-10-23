@@ -6,14 +6,10 @@ M3_TRUNC6_CKPT=<HF dir> uses the real gate weights/bias of layers 3-5."""
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import glob
-import importlib.util
 import json
 import os
-import sys
-import types
 
 import pytest
 import torch
@@ -24,101 +20,19 @@ E, H, K, RSF = 128, 6144, 4, 2.0
 ROWS = (1, 8, 37, 512, 4096)
 
 
-def _fork_root() -> str:
-    root = os.environ.get("SGLANG_FORK_PY")
-    if not root or not os.path.exists(os.path.join(root, "kernels", "ops", "moe", "moe_fused_gate.py")):
-        pytest.skip("SGLANG_FORK_PY (fork python/sglang dir) not set")
+@functools.lru_cache(maxsize=None)
+def _fork():
+    """(linear_bf16_fp32, moe_fused_gate, is_arch_support_pdl()) from the fork's own source files."""
     from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+    from sglang_fork import install_stubs, load
 
     try:
         deep_gemm_module()
     except ImportError as exc:
         pytest.skip(str(exc))
-    return root
-
-
-class _Env:
-    def __init__(self, value):
-        self.value = value
-
-    def get(self):
-        return self.value
-
-
-class _Envs(types.ModuleType):
-    """sglang.srt.environ.envs: only the knobs the loaded files read; everything else is unset."""
-
-    _values = {"SGLANG_OPT_BF16_FP32_GEMM_ALGO": "deep_gemm", "SGLANG_OPT_BF16_FP32_GEMM_CUTEDSL_MIN_M": 4096,
-               "SGLANG_DEEPGEMM_SANITY_CHECK": False}
-
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        return _Env(self._values.get(name, False))
-
-
-class _Flags(types.ModuleType):
-    """sglang.srt.layers.deep_gemm_wrapper.configurer on a Blackwell inference box."""
-
-    _values = {"ENABLE_JIT_DEEPGEMM": True, "DEEPGEMM_BLACKWELL": True, "DEEPGEMM_SCALE_UE8M0": True,
-               "DEEPGEMM_NEED_TMA_ALIGNED_SCALES": False}
-
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        return self._values.get(name, False)
-
-
-def _module(name, **attrs):
-    m = types.ModuleType(name)
-    m.__path__ = []  # behaves as a package for submodule imports
-    for k, v in attrs.items():
-        setattr(m, k, v)
-    sys.modules[name] = m
-    return m
-
-
-def _load(path: str, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-@functools.lru_cache(maxsize=None)
-def _fork():
-    """Load the fork's router files once; returns (linear_bf16_fp32, moe_fused_gate, is_arch_support_pdl())."""
-    root = _fork_root()
-    import deep_gemm  # real package; the fork files call it through their own wrappers
-
-    pdl = torch.cuda.get_device_capability()[0] >= 9  # fork: is_arch_support_pdl() = CUDA arch major >= 9
-    _module("sglang")
-    _module("sglang.kernel_api_logging", debug_kernel_api=lambda fn: fn)
-    _module("sglang.kernels")
-    _module("sglang.kernels.jit")
-    _module("sglang.kernels.jit.utils", cache_once=functools.lru_cache(maxsize=None), is_arch_support_pdl=lambda: pdl,
-            load_jit=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("CUDA JIT path not under test")))
-    _module("sglang.kernels.ops")
-    _module("sglang.kernels.ops.moe")
-    _module("sglang.kernels.ops.moe.moe_route_radix", covered=lambda *a, **k: False)
-    _module("sglang.srt")
-    envs = _Envs("sglang.srt.environ.envs")
-    _module("sglang.srt.environ", envs=envs)
-    _module("sglang.srt.utils", get_bool_env_var=lambda *a, **k: False, is_hip=lambda: False, is_musa=lambda: False)
-    _module("sglang.srt.server_args", ServerArgs=object)
-    layers = _module("sglang.srt.layers")
-    _module("sglang.srt.layers.deep_gemm_wrapper")
-    _module("sglang.srt.layers.deep_gemm_wrapper.compile_utils",
-            deep_gemm_execution_hook=lambda *a, **k: contextlib.nullcontext(),
-            DeepGemmKernelType=types.SimpleNamespace(GEMM_NT_BF16BF16F32="GEMM_NT_BF16BF16F32", GEMM_NT_F8F8BF16="GEMM_NT_F8F8BF16",
-                                                     GROUPED_GEMM_NT_F8F8BF16_CONTIG="c", GROUPED_GEMM_NT_F8F8BF16_MASKED="m"))
-    sys.modules["sglang.srt.layers.deep_gemm_wrapper.configurer"] = _Flags("sglang.srt.layers.deep_gemm_wrapper.configurer")
-    entry = _load(os.path.join(root, "srt", "layers", "deep_gemm_wrapper", "entrypoint.py"), "sglang.srt.layers.deep_gemm_wrapper.entrypoint")
-    sys.modules["sglang.srt.layers.deep_gemm_wrapper"] = entry  # `from sglang.srt.layers import deep_gemm_wrapper`
-    layers.deep_gemm_wrapper = entry
-    gemm = _load(os.path.join(root, "kernels", "ops", "attention", "dsv4", "gemm.py"), "sglang.kernels.ops.attention.dsv4.gemm")
-    gate = _load(os.path.join(root, "kernels", "ops", "moe", "moe_fused_gate.py"), "sglang.kernels.ops.moe.moe_fused_gate")
+    pdl = install_stubs()
+    gemm = load("kernels/ops/attention/dsv4/gemm.py", "sglang.kernels.ops.attention.dsv4.gemm")
+    gate = load("kernels/ops/moe/moe_fused_gate.py", "sglang.kernels.ops.moe.moe_fused_gate")
     assert gemm._linear_bf16_fp32_algo == "deep_gemm"
     return gemm.linear_bf16_fp32, gate.moe_fused_gate, pdl
 

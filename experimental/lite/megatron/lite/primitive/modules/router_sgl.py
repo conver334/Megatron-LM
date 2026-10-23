@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 
 from megatron.lite.primitive.kernels.sgl_moe_fused_gate import moe_fused_gate
+from megatron.lite.primitive.kernels.visible import visible_forward
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter, _GatingLinear
 from megatron.lite.primitive.modules.router_replay import gather_replayed_router_scores
 
@@ -86,7 +87,7 @@ class SglSigmoidTopKRouter(SigmoidTopKRouter):
         ids = ids_k.long()  # SGLang slot order (biased-descending), not expert-id order
         sel = torch.gather(torch.sigmoid(logits), 1, ids)
         probs = sel / sel.sum(dim=-1, keepdim=True) * (self.scaling_factor or 1.0)
-        scores = probs + (weights_k - probs).detach()  # kernel bytes forward, formula backward
+        scores = visible_forward(weights_k, probs)  # kernel bytes forward, formula backward
         if self.router_replay is not None:
             selected = self.router_replay.select_indices(ids)
             if selected is not ids:
