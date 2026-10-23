@@ -286,6 +286,10 @@ class MiniMaxM3Model(nn.Module):
         """Hook for sibling impls (``align`` fuses the last residual add into the norm)."""
         return self.norm(h)
 
+    def _token_loss(self, logits: torch.Tensor, labels_sb: torch.Tensor) -> torch.Tensor:
+        """Per-token negative log-likelihood ``[S, B]``; hook for sibling impls (``align`` shows inference bytes)."""
+        return vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+
     def _reduce_loss(self, token_loss: torch.Tensor, loss_mask: torch.Tensor | None) -> torch.Tensor:
         """Mean over the supervised tokens of the whole sequence, also under context parallel.
 
@@ -352,7 +356,7 @@ class MiniMaxM3Model(nn.Module):
                 if t != 1.0:
                     logits = logits / t
                 labels_sb = labels.transpose(0, 1).contiguous()
-                loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                loss = self._token_loss(logits, labels_sb)
                 output["loss"] = self._reduce_loss(loss, loss_mask)
                 output["log_probs"] = (-loss).transpose(0, 1).contiguous()
                 if calculate_entropy:

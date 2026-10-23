@@ -182,3 +182,35 @@ def test_dense_mlp_swap_shows_sglang_bytes_and_keeps_te_backward():
     assert torch.equal(x_sw.grad, x_ref.grad)
     for a, b in zip(ref.parameters(), sw.parameters()):
         assert torch.equal(a.grad, b.grad)
+
+
+def test_lm_head_swap_and_token_loss_show_sglang_bytes_and_keep_native_backward():
+    from megatron.lite.model.minimax_m3.align.lm_head import SglVocabParallelOutput, sgl_token_loss
+    from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
+    from megatron.lite.primitive.kernels.sgl_log_softmax import token_logprob
+    from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
+    from megatron.lite.primitive.parallel.linear import VocabParallelOutput
+
+    _deepgemm()
+    V, T = 4096, 48
+    torch.manual_seed(5)
+    ref, sw = VocabParallelOutput(V, H, _ps()).cuda(), VocabParallelOutput(V, H, _ps()).cuda()
+    with torch.no_grad():
+        ref.col.linear.weight.normal_(std=0.02)
+        sw.col.linear.weight.copy_(ref.col.linear.weight)
+    SglVocabParallelOutput.swap_in(sw)
+    x = torch.randn(T, 1, H, device="cuda", dtype=torch.bfloat16)
+    labels = torch.randint(0, V, (T, 1), device="cuda")
+    x_ref, x_sw = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+    logits_ref, logits_sw = ref(x_ref), sw(x_sw)
+    assert torch.equal(logits_sw, linear_bf16(x, sw.col.linear.weight))
+    nll_ref = vocab_parallel_cross_entropy(logits_ref, labels, None)
+    nll_sw = sgl_token_loss(logits_sw, labels, None)
+    assert torch.equal(nll_sw, -token_logprob(logits_sw.detach().float(), labels))
+    print(f"\nlm_head: DeepGEMM vs vanilla matmul logits mismatches {(logits_sw != logits_ref).sum().item()}/{logits_ref.numel()}; "
+          f"BI log_softmax nll vs CE nll mismatches {(nll_sw != nll_ref).sum().item()}/{T}, max |d| {(nll_sw - nll_ref).abs().max().item():.2e}")
+    g = torch.randn_like(nll_ref)
+    (nll_ref * g).sum().backward()
+    (nll_sw * g).sum().backward()
+    assert torch.equal(x_sw.grad, x_ref.grad)
+    assert torch.equal(sw.col.linear.weight.grad, ref.col.linear.weight.grad)

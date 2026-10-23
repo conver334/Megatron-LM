@@ -206,6 +206,7 @@ def test_swapped_attribute_names_exist_in_lite_source():
     assert "self.mlp_norm" in layer_src and "self.moe" in layer_src
     assert "self.norm" in inspect.getsource(LM.MiniMaxM3Model.__init__)
     assert "self._final_norm(" in inspect.getsource(LM.MiniMaxM3Model.forward)
+    assert "self._token_loss(" in inspect.getsource(LM.MiniMaxM3Model.forward)
     assert "self.router" in inspect.getsource(LM.M3MoELayer.__init__)
 
 
@@ -269,3 +270,24 @@ def test_dense_mlp_swap_touches_dense_layers_only(monkeypatch):
     for owner in (dense, moe, SimpleNamespace()):
         M.ALIGN_SWAPS["dense_mlp"](owner, SimpleNamespace(), None)
     assert seen == [dense.mlp]
+
+
+def test_lm_head_swap_touches_the_model_head_only(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.model.minimax_m3.align.lm_head")
+
+    class SglVocabParallelOutput:
+        @classmethod
+        def swap_in(cls, module):
+            seen.append(module)
+            return module
+
+    fake.SglVocabParallelOutput = SglVocabParallelOutput
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    model = SimpleNamespace(head=object())
+    for owner in (SimpleNamespace(attn=object()), SimpleNamespace(head=None), model):
+        M.ALIGN_SWAPS["lm_head"](owner, SimpleNamespace(), None)
+    assert seen == [model.head]
+    assert "self._token_loss(" in __import__("inspect").getsource(__import__("megatron.lite.model.minimax_m3.lite.model", fromlist=["x"]).MiniMaxM3Model.forward)

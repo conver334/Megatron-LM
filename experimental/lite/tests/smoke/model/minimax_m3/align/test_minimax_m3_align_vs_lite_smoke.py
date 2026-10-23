@@ -74,7 +74,7 @@ def _run(proto, cfg, src, seq_lens, impl_cfg, *, pre_roll=False):
     grads = {n: p.grad.detach().clone() for n, p in chunk.named_parameters() if p.grad is not None}
     logits = out.get("logits")
     result = dict(loss=loss.detach().clone(), grads=grads, logits=None if logits is None else logits.detach().clone(),
-                  routing=routing)
+                  routing=routing, log_probs=out["log_probs"].detach().clone())
     del bundle, chunk
     torch.cuda.empty_cache()
     return result
@@ -297,3 +297,34 @@ def test_all_dense_switches_run_close_to_lite(magi_cfg, magi_source, dist):
     rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
     assert rel < 1e-2, rel
     print(f"\nall dense switches {DENSE_SWITCHES}: loss rel diff vs lite {rel:.2e}", flush=True)
+
+
+ALL_SWITCHES = ("rmsnorm", "router", "o_proj", "qkv", "dense_mlp", "lm_head")
+
+
+def test_all_switches_run_and_report_token_logprob_delta(magi_cfg, magi_source, dist):
+    """Every switch on: the C5 quantity ``log_probs`` comes from the BI log_softmax of DeepGEMM logits."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.lm_head import SglVocabParallelOutput
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+
+    _magi_deps()
+    try:
+        deep_gemm_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=ALL_SWITCHES))
+    assert isinstance(bundle.chunks[0].head, SglVocabParallelOutput)
+    del bundle
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=ALL_SWITCHES))
+    assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
+    rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-2, rel
+    lp_l, lp_a = lite["log_probs"], align["log_probs"]
+    print(f"\nall switches {ALL_SWITCHES}: loss rel diff vs lite {rel:.2e}; token log_probs differ on "
+          f"{(lp_l != lp_a).float().mean().item():.4f} of tokens, max |d| {(lp_l - lp_a).abs().max().item():.2e}", flush=True)

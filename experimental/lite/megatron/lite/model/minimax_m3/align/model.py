@@ -69,6 +69,15 @@ def _swap_dense_mlp(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState
         SglM3DenseMLP.swap_in(mlp)
 
 
+def _swap_lm_head(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """Model head -> batch-invariant bf16 GEMM; token loss -> -logprob from SGLang's BI log_softmax."""
+    from megatron.lite.model.minimax_m3.align.lm_head import SglVocabParallelOutput
+
+    head = getattr(owner, "head", None)
+    if head is not None:
+        SglVocabParallelOutput.swap_in(head)
+
+
 # name -> swap, applied to every layer and then to the model (final norm / head live there);
 # keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
 ALIGN_SWAPS: dict[str, Swap] = {
@@ -77,6 +86,7 @@ ALIGN_SWAPS: dict[str, Swap] = {
     "o_proj": _swap_o_proj,
     "qkv": _swap_qkv,
     "dense_mlp": _swap_dense_mlp,
+    "lm_head": _swap_lm_head,
 }
 
 
@@ -143,6 +153,13 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
         self.align_modules = align_modules
         for prev, layer in zip(self.layers, list(self.layers)[1:]):
             layer._prev = prev
+
+    def _token_loss(self, logits: torch.Tensor, labels_sb: torch.Tensor) -> torch.Tensor:
+        if "lm_head" not in self.align_modules:
+            return super()._token_loss(logits, labels_sb)
+        from megatron.lite.model.minimax_m3.align.lm_head import sgl_token_loss
+
+        return sgl_token_loss(logits, labels_sb, self.ps.tp_group)
 
     def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
         if "rmsnorm" not in self.align_modules:
