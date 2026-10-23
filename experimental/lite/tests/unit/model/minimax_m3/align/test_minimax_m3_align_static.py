@@ -228,3 +228,23 @@ def test_o_proj_swap_touches_every_attention_layer(monkeypatch):
     for owner in (*layers, model):
         M.ALIGN_SWAPS["o_proj"](owner, SimpleNamespace(), None)
     assert seen == [layer.attn.proj for layer in layers]
+
+
+def test_qkv_swap_touches_every_attention_layer(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.primitive.parallel.linear_sgl")
+
+    class SglColumnParallelLinear:
+        @classmethod
+        def swap_in(cls, module):
+            seen.append(module)
+            return module
+
+    fake.SglColumnParallelLinear = SglColumnParallelLinear
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    layers = [SimpleNamespace(attn=SimpleNamespace(qkv=object())) for _ in range(2)]
+    for owner in (*layers, SimpleNamespace()):
+        M.ALIGN_SWAPS["qkv"](owner, SimpleNamespace(), None)
+    assert seen == [layer.attn.qkv for layer in layers]

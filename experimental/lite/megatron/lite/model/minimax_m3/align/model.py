@@ -51,9 +51,18 @@ def _swap_o_proj(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *
         SglRowParallelLinear.swap_in(attn.proj)
 
 
+def _swap_qkv(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """Attention input norm + QKV projection -> SGLang fused add+norm of the residual pair + DeepGEMM; TE backward."""
+    from megatron.lite.primitive.parallel.linear_sgl import SglColumnParallelLinear
+
+    attn = getattr(owner, "attn", None)
+    if attn is not None:
+        SglColumnParallelLinear.swap_in(attn.qkv)
+
+
 # name -> swap, applied to every layer and then to the model (final norm / head live there);
 # keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
-ALIGN_SWAPS: dict[str, Swap] = {"rmsnorm": _swap_rmsnorm, "router": _swap_router, "o_proj": _swap_o_proj}
+ALIGN_SWAPS: dict[str, Swap] = {"rmsnorm": _swap_rmsnorm, "router": _swap_router, "o_proj": _swap_o_proj, "qkv": _swap_qkv}
 
 
 class MiniMaxM3AlignLayer(MiniMaxM3Layer):
@@ -65,27 +74,40 @@ class MiniMaxM3AlignLayer(MiniMaxM3Layer):
         for name in align_modules:
             ALIGN_SWAPS[name](self, config, ps, **(align_opts or {}))
         self.align_modules = tuple(align_modules)
-        self._residual_pair = None
+        self._residual_pair = None  # (delta, residual) of this layer's last add; consumed by the next norm site
+        self._prev = None  # previous align layer on this stage (set by MiniMaxM3AlignModel)
 
     def forward(self, x: torch.Tensor, magi_ctx):
-        if "rmsnorm" not in self.align_modules:
+        fused_norms = "rmsnorm" in self.align_modules
+        if not fused_norms and "qkv" not in self.align_modules:
             return super().forward(x, magi_ctx)
         from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm
 
-        if self.is_sparse_attention:
-            delta = self.attn(x, magi_ctx=magi_ctx)
-        else:
-            delta = self.attn(
-                x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
-            )
-        if self.moe is not None:
+        if "qkv" in self.align_modules:  # SGLang input_layernorm(prev_out, residual) inside the swapped qkv
+            self.attn.qkv._residual_pair = self._prev._residual_pair if self._prev is not None else None
+        try:
+            if self.is_sparse_attention:
+                delta = self.attn(x, magi_ctx=magi_ctx)
+            else:
+                delta = self.attn(
+                    x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
+                )
+        finally:
+            if "qkv" in self.align_modules:
+                self.attn.qkv._residual_pair = None
+        if self._prev is not None:
+            self._prev._residual_pair = None
+        if self.moe is not None and fused_norms:
             # SGLang post_attention_layernorm(attn_out, residual): norm of the fp32 sum, residual <- bf16 sum
             normed, x = gemma_fused_add_rmsnorm(delta, x, self.mlp_norm.weight, self.mlp_norm.eps)
             delta = self.moe(normed)
+        elif self.moe is not None:
+            x = x + delta
+            delta = self.moe(self.mlp_norm(x))
         else:
             x = x + delta
             delta = self.mlp(x)
-        self._residual_pair = (delta, x)  # the final norm fuses this last add the same way
+        self._residual_pair = (delta, x)  # the next input norm / final norm fuses this add the same way
         return x + delta
 
 
@@ -98,6 +120,8 @@ class MiniMaxM3AlignModel(MiniMaxM3Model):
         for name in align_modules:
             ALIGN_SWAPS[name](self, config, ps, **align_opts)
         self.align_modules = align_modules
+        for prev, layer in zip(self.layers, list(self.layers)[1:]):
+            layer._prev = prev
 
     def _final_norm(self, h: torch.Tensor) -> torch.Tensor:
         if "rmsnorm" not in self.align_modules:

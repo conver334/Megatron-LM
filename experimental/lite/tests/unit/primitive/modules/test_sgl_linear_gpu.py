@@ -72,3 +72,72 @@ def test_o_proj_swap_forward_is_deepgemm_bytes_and_backward_is_te():
     y_sw.backward(g)
     assert torch.equal(x_sw.grad, x_ref.grad)  # same TE backward graph, same bytes
     assert torch.equal(swapped.linear.weight.grad, ref.linear.weight.grad)
+
+
+@pytest.mark.parametrize("with_norm_out", [False, True])
+def test_qkv_swap_shows_sglang_norm_and_gemm_bytes_and_keeps_te_backward(with_norm_out):
+    from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
+    from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm_kernel, gemma_rmsnorm_kernel
+    from megatron.lite.primitive.parallel.linear import ColumnParallelLinear
+    from megatron.lite.primitive.parallel.linear_sgl import SglColumnParallelLinear
+
+    _deepgemm()
+    try:
+        gemma_rmsnorm_kernel(), gemma_fused_add_rmsnorm_kernel()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    torch.manual_seed(2)
+
+    def build():
+        m = ColumnParallelLinear(H, 3 * H, _ps(), bias=False, normalization="RMSNorm", eps=1e-6, zero_centered_gamma=True,
+                                 return_layernorm_output=with_norm_out).cuda()
+        return m
+
+    ref, sw = build(), build()
+    with torch.no_grad():
+        ref.linear.weight.normal_(std=0.02)
+        ref.linear.layer_norm_weight.normal_(std=0.1)
+        sw.linear.weight.copy_(ref.linear.weight)
+        sw.linear.layer_norm_weight.copy_(ref.linear.layer_norm_weight)
+    SglColumnParallelLinear.swap_in(sw)
+    delta = torch.randn(S, B, H, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(S, B, H, device="cuda", dtype=torch.bfloat16) * 3
+    x = residual + delta  # the bf16 residual stream lite feeds into the layer
+    w_norm = ref.linear.layer_norm_weight.detach().to(torch.bfloat16)
+
+    # no pair (layer 0): standalone gemma_rmsnorm of x
+    out_sw = sw(x)
+    out_sw, norm_sw = out_sw if with_norm_out else (out_sw, None)
+    normed0 = gemma_rmsnorm_kernel()(x.reshape(-1, H).contiguous(), w_norm, 1e-6).reshape(x.shape)
+    assert torch.equal(out_sw, linear_bf16(normed0, sw.linear.weight))
+    if with_norm_out:
+        assert torch.equal(norm_sw, normed0)
+
+    # with the previous layer's pair: SGLang fused add+norm of the fp32 sum
+    sw._residual_pair = (delta, residual)
+    x_ref, x_sw = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+    out_ref = ref(x_ref)
+    out_sw = sw(x_sw)
+    sw._residual_pair = None
+    out_ref, norm_ref = out_ref if with_norm_out else (out_ref, None)
+    out_sw, norm_sw = out_sw if with_norm_out else (out_sw, None)
+    hid, res = delta.reshape(-1, H).clone(), residual.reshape(-1, H).clone()
+    gemma_fused_add_rmsnorm_kernel()(hid, res, w_norm, 1e-6)
+    normed = hid.reshape(x.shape)
+    assert torch.equal(out_sw, linear_bf16(normed, sw.linear.weight))
+    print(f"\nqkv: fused-add-norm+DeepGEMM vs TE LayerNormLinear bf16 mismatches {(out_sw != out_ref).sum().item()}/{out_ref.numel()}")
+    if with_norm_out:
+        assert torch.equal(norm_sw, normed)
+    g = torch.randn_like(out_ref)
+    if with_norm_out:
+        g2 = torch.randn_like(norm_ref)
+        (out_ref * g).sum().backward(retain_graph=True)
+        (norm_ref * g2).sum().backward()
+        (out_sw * g).sum().backward(retain_graph=True)
+        (norm_sw * g2).sum().backward()
+    else:
+        out_ref.backward(g)
+        out_sw.backward(g)
+    assert torch.equal(x_sw.grad, x_ref.grad)
+    assert torch.equal(sw.linear.weight.grad, ref.linear.weight.grad)
+    assert torch.equal(sw.linear.layer_norm_weight.grad, ref.linear.layer_norm_weight.grad)

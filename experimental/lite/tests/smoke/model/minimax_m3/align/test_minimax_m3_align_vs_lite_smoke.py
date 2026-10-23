@@ -237,3 +237,32 @@ def test_o_proj_switch_runs_close_to_lite_and_is_visible(magi_cfg, magi_source, 
     # the swap itself is pinned by the module count and by test_sgl_linear_gpu.py
     print(f"\no_proj switch: {n_sgl} projections swapped, loss rel diff vs lite {rel:.2e} "
           f"(bitwise equal to lite: {torch.equal(lite['loss'], align['loss'])})", flush=True)
+
+
+def test_qkv_switch_runs_close_to_lite(magi_cfg, magi_source, dist):
+    """align_modules=("rmsnorm", "qkv"): every attention input norm + QKV shows SGLang bytes (fused add+norm of
+    the previous layer's residual pair, DeepGEMM); residual pairs are handed layer to layer and cleared."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+    from megatron.lite.primitive.parallel.linear_sgl import SglColumnParallelLinear
+
+    _magi_deps()
+    try:
+        deep_gemm_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("rmsnorm", "qkv")))
+    chunk = bundle.chunks[0]
+    assert sum(isinstance(m, SglColumnParallelLinear) for m in chunk.modules()) == len(chunk.layers)
+    assert all(layer._prev is prev for prev, layer in zip(chunk.layers, list(chunk.layers)[1:]))
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rmsnorm", "qkv")))
+    assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
+    rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-2, rel
+    print(f"\nqkv switch: loss rel diff vs lite {rel:.2e} (bitwise equal: {torch.equal(lite['loss'], align['loss'])})", flush=True)
