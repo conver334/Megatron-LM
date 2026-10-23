@@ -47,4 +47,6 @@ def test_fork_mm_override_equals_mlite_linear_bf16(name):
         ours = linear_bf16(x, w)
         assert fork.dtype == torch.bfloat16 and torch.equal(fork, ours), (name, m, (fork != ours).sum().item())
         assert torch.equal(ours, full[:m]), (name, m)  # batch-invariant
-    print(f"\n{name} [{k}->{n}]: fork mm override == mlite linear_bf16 and M-invariant for M in {ROWS}", flush=True)
+    cublas = torch.mm(x_all, w.t())  # what lite's TE/cuBLAS forward produces today (same bf16-in, bf16-out contract)
+    print(f"\n{name} [{k}->{n}]: fork mm override == mlite linear_bf16 and M-invariant for M in {ROWS}; "
+          f"vs cuBLAS bf16 GEMM: {(full != cublas).float().mean().item():.4f} of outputs differ", flush=True)
