@@ -80,7 +80,19 @@ def install_stubs() -> bool:
         "sglang.srt.utils.common", {"get_bool_env_var": _bool_env, "get_dispatch_device_backend": lambda: "CUDA"},
         lambda name: (lambda *a, **k: False))
     _module("sglang.srt.server_args", ServerArgs=object)
+    # fused_moe_triton_kernels.py: quant helpers are never reached for bf16; environment probes as on a CUDA box
+    for q in ("sglang.kernels.ops.quantization", "sglang.kernels.ops.quantization.fp8_kernel", "sglang.kernels.ops.quantization.int8_kernel"):
+        sys.modules[q] = _AttrModule(q, {}, lambda name: (lambda *a, **k: (_ for _ in ()).throw(RuntimeError(f"quant path {name} not under test"))))
+    utils._values.update({"cpu_has_amx_support": lambda: False, "is_cpu": lambda: False, "is_cuda": lambda: True,
+                          "is_sm90_supported": lambda: False, "is_xpu": lambda: False})
+    sys.modules["sglang.srt.utils.nsys_profiler"] = _AttrModule(
+        "sglang.srt.utils.nsys_profiler", {"nvtx_decorator": lambda *a, **k: (a[0] if a and callable(a[0]) and not k else (lambda fn: fn))},
+        lambda name: (lambda *a, **k: None))
+    sys.modules["sglang.srt.batch_invariant_ops"] = _AttrModule("sglang.srt.batch_invariant_ops", {"is_batch_invariant_mode_enabled": lambda: True}, lambda name: None)
+    sys.modules["sglang.srt.layers.moe"] = _AttrModule("sglang.srt.layers.moe", {}, lambda name: None)
+    sys.modules["sglang.srt.layers.moe.utils"] = _AttrModule("sglang.srt.layers.moe.utils", {"get_moe_padding_size": lambda aiter: 0}, lambda name: None)
     layers = _module("sglang.srt.layers")
+    layers.moe = sys.modules["sglang.srt.layers.moe"]
     _module("sglang.srt.layers.deep_gemm_wrapper")
     _module("sglang.srt.layers.deep_gemm_wrapper.compile_utils",
             deep_gemm_execution_hook=lambda *a, **k: contextlib.nullcontext(),

@@ -58,6 +58,9 @@ class ImplConfig(_lite.ImplConfig):
     # "fp32" = cuBLAS torch.mm (BI=0 baseline); "fp32_deepgemm" = SGLANG_OPT_BF16_FP32_GEMM_ALGO=deep_gemm, the
     # batch-invariant contract (bf16 high/low split through DeepGEMM); "bf16" = the SGLang default we do not use.
     align_router_gate: str = "fp32"
+    # shared expert in the MoE switch: "separate" (SGLang EP>1 / --disable-shared-experts-fusion: final + shared in
+    # bf16) or "fused" (SGLang EP=1 default: extra routing slot, summed in the fp32 moe_sum_reduce)
+    align_moe_shared: str = "separate"
     # PackedBatch contract (verl_mlite, other protocols): labels/loss_mask arrive unrolled and the protocol rolls
     # them left per document (last token masked). lite does not roll; keep False only for lite-style batches.
     roll_labels: bool = True
@@ -109,7 +112,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         model_cls=MiniMaxM3AlignModel,
         extra_train_cfg={
             "align_modules": tuple(impl_cfg.align_modules),
-            "align_opts": {"router_gate": impl_cfg.align_router_gate},
+            "align_opts": {"router_gate": impl_cfg.align_router_gate, "moe_shared": impl_cfg.align_moe_shared},
         },
     )
     for chunk in bundle.chunks:

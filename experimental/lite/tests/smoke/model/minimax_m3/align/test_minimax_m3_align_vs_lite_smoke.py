@@ -319,7 +319,7 @@ def test_all_dense_switches_run_close_to_lite(magi_cfg, magi_source, dist):
     print(f"\nall dense switches {DENSE_SWITCHES}: loss rel diff vs lite {rel:.2e}", flush=True)
 
 
-ALL_SWITCHES = ("rmsnorm", "router", "o_proj", "qkv", "dense_mlp", "lm_head")
+ALL_SWITCHES = ("rmsnorm", "router", "o_proj", "qkv", "dense_mlp", "lm_head", "experts")
 
 
 def test_all_switches_run_and_report_token_logprob_delta(magi_cfg, magi_source, dist):
@@ -368,3 +368,37 @@ def test_recompute_full_with_switches_keeps_every_gradient_and_the_forward_bytes
     assert rec["grads"].keys() == plain["grads"].keys(), set(plain["grads"]) ^ set(rec["grads"])
     assert any(k.startswith("layers.0.") for k in rec["grads"]) and any(k.startswith("embed") for k in rec["grads"])
     print(f"\nrecompute=full + all switches: loss/log_probs bitwise equal, {len(rec['grads'])} grads present", flush=True)
+
+
+@pytest.mark.parametrize("shared", ["separate", "fused"])
+def test_experts_switch_runs_close_to_lite_and_shared_modes_differ(magi_cfg, magi_source, dist, shared):
+    """align_modules=("router", "experts"): MoE layers show the SGLang Triton fused-MoE bytes; the shared-expert mode is a
+    visible contract choice (fused slot vs separate add) so the two modes must not coincide."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.moe import SglM3MoELayer
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+
+    _magi_deps()
+    try:
+        deep_gemm_module()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("router", "experts"), align_moe_shared=shared))
+    chunk = bundle.chunks[0]
+    n_moe = sum(1 for layer in chunk.layers if layer.moe is not None)
+    assert sum(isinstance(m, SglM3MoELayer) for m in chunk.modules()) == n_moe > 0
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router", "experts"), align_moe_shared=shared))
+    other = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("router", "experts"),
+                                                               align_moe_shared="fused" if shared == "separate" else "separate"))
+    assert torch.isfinite(align["loss"]).all() and all(torch.isfinite(g).all() for g in align["grads"].values())
+    rel = ((lite["loss"] - align["loss"]).abs() / lite["loss"].abs()).item()
+    assert rel < 1e-2, rel
+    assert not torch.equal(align["log_probs"], other["log_probs"]), "shared-expert modes should differ in bytes"
+    print(f"\nexperts switch (shared={shared}): {n_moe} MoE layers swapped, loss rel diff vs lite {rel:.2e}, "
+          f"log_probs vs lite differ on {(lite['log_probs'] != align['log_probs']).float().mean().item():.3f} of tokens", flush=True)

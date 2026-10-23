@@ -80,6 +80,15 @@ def _swap_lm_head(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, 
         SglVocabParallelOutput.swap_in(head)
 
 
+def _swap_experts(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *, moe_shared: str = "separate", **_opts) -> None:
+    """MoE layer -> SGLang Triton fused-MoE bytes (deterministic config), shared expert separate or fused slot."""
+    from megatron.lite.model.minimax_m3.align.moe import SglM3MoELayer
+
+    moe = getattr(owner, "moe", None)
+    if moe is not None:
+        SglM3MoELayer.swap_in(moe, shared=moe_shared)
+
+
 # name -> swap, applied to every layer and then to the model (final norm / head live there);
 # keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
 ALIGN_SWAPS: dict[str, Swap] = {
@@ -89,6 +98,7 @@ ALIGN_SWAPS: dict[str, Swap] = {
     "qkv": _swap_qkv,
     "dense_mlp": _swap_dense_mlp,
     "lm_head": _swap_lm_head,
+    "experts": _swap_experts,
 }
 
 

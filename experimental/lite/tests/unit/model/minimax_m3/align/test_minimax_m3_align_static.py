@@ -37,7 +37,7 @@ def test_align_impl_config_is_lite_plus_align_modules_with_training_recipe_defau
 
     lite_names = {f.name for f in fields(L.ImplConfig)}
     align_names = {f.name for f in fields(A.ImplConfig)}
-    assert align_names - lite_names == {"align_modules", "align_router_gate", "roll_labels"}
+    assert align_names - lite_names == {"align_modules", "align_router_gate", "align_moe_shared", "roll_labels"}
     cfg = A.ImplConfig()
     assert cfg.align_modules == ()
     for k, v in L.MINIMAX_TRAINING_IMPL.items():
@@ -101,7 +101,7 @@ def test_align_build_model_forwards_lite_cfg_and_align_modules(monkeypatch):
     assert bundle.forward_step is A._forward_step
     assert bundle.chunks[0].align_roll_labels is True
     tc = seen["train_cfg"]
-    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "fp32"}
+    assert tc.align_modules == ("rmsnorm",) and tc.align_opts == {"router_gate": "fp32", "moe_shared": "separate"}
     assert tc.rope_fusion is True and tc.msa_index_input_norm == "fused" and tc.moe_permute_fusion is False
     assert bundle.chunks[0].magi_settings.dense_kernel_backend == "fa4_varlen"
 
@@ -309,3 +309,23 @@ def test_qkv_switch_refuses_pipeline_parallel():
 
     with pytest.raises(NotImplementedError, match="pipeline"):
         A.build_model(MiniMaxM3Config(), impl_cfg=A.ImplConfig(parallel=ParallelConfig(pp=2), optimizer=None, align_modules=("qkv",)))
+
+
+def test_experts_swap_touches_moe_layers_only(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.model.minimax_m3.align.moe")
+
+    class SglM3MoELayer:
+        @classmethod
+        def swap_in(cls, module, *, shared):
+            seen.append((module, shared))
+            return module
+
+    fake.SglM3MoELayer = SglM3MoELayer
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    moe_layer = SimpleNamespace(moe=object())
+    for owner in (moe_layer, SimpleNamespace(moe=None), SimpleNamespace()):
+        M.ALIGN_SWAPS["experts"](owner, SimpleNamespace(), None, moe_shared="fused")
+    assert seen == [(moe_layer.moe, "fused")]
