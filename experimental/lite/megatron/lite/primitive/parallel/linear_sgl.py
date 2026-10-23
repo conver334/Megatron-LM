@@ -15,7 +15,7 @@ from megatron.lite.primitive.parallel.linear import RowParallelLinear
 class SglRowParallelLinear(RowParallelLinear):
     @classmethod
     def swap_in(cls, module: RowParallelLinear) -> "SglRowParallelLinear":
-        if module.tp_size != 1 or module.linear.bias is not None:
+        if module.tp_size != 1 or getattr(module.linear, "use_bias", False):
             raise NotImplementedError("align linear: tp=1, no bias")
         module.__class__ = cls
         return module
