@@ -475,13 +475,13 @@ def test_msa_swaps_touch_indexer_and_core_only(monkeypatch):
     seen = []
     fake = ModuleType("megatron.lite.model.minimax_m3.align.msa")
     fake.swap_in_index_proj = lambda attn: seen.append(("index_proj", attn))
-    fake.swap_in_msa_core = lambda attn: seen.append(("msa_core", attn))
+    fake.swap_in_msa_core = lambda attn, cp_size=1: seen.append(("msa_core", attn, cp_size))
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     layer = SimpleNamespace(attn=object())
     for owner in (layer, SimpleNamespace(attn=None), SimpleNamespace()):
         M.ALIGN_SWAPS["index_proj"](owner, SimpleNamespace(), None)
-        M.ALIGN_SWAPS["msa_core"](owner, SimpleNamespace(), None)
-    assert seen == [("index_proj", layer.attn), ("msa_core", layer.attn)]
+        M.ALIGN_SWAPS["msa_core"](owner, SimpleNamespace(), SimpleNamespace(cp_size=2))
+    assert seen == [("index_proj", layer.attn), ("msa_core", layer.attn, 2)]
     keys = list(M.ALIGN_SWAPS)
     assert keys.index("rope") < keys.index("index_proj") < keys.index("msa_core")
 
