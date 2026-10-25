@@ -560,3 +560,40 @@ def test_attn_dense_switch_runs_close_to_lite_and_is_visible(magi_cfg, magi_sour
     assert torch.isfinite(align["loss"]).all() and rel < 1e-3, rel
     print(f"\nattn_dense switch: {len(dense)} dense layers swapped, loss rel diff vs lite {rel:.2e}, "
           f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
+
+def test_msa_layers_match_sglang_prefill_path_bitwise(magi_cfg, magi_source, dist):
+    """Model-level MSA contract: on the proxy forward, every MSA layer's Magi ``calc_msa_v1`` output (indexer + top-k +
+    sparse attention on the actual q/k/v/index-q/k) equals the SGLang fork's CuTe prefill chain run by path on the
+    same tensors, bitwise, so the MSA core needs no visible switch."""
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels import magi_msa
+    from megatron.lite.primitive.modules.attention.msa import MagiCoreAttention
+    from msa_xstack import fork_prefill
+    from sglang_fork import load_fork_msa
+
+    _magi_deps()
+    ci, cw = load_fork_msa()
+    seq_lens = BATCHES["packed"]
+    captured = {}
+
+    def install(chunk):
+        for i, layer in enumerate(chunk.layers):
+            core = getattr(getattr(layer, "attn", None), "core_attn", None)
+            if isinstance(core, MagiCoreAttention):
+                core.register_forward_hook(
+                    lambda m, args, kwargs, out, i=i: captured.__setitem__(i, ([a.detach().clone() for a in args], kwargs["magi_ctx"], out.detach().clone())),
+                    with_kwargs=True)
+
+    _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}),
+         pre_roll=True, hooks=install)
+    assert captured, "no MSA layer in the proxy"
+    for i, (args, ctx, out) in sorted(captured.items()):
+        q, k, v, iq, ik = [magi_msa.undispatch_tokens(t, ctx) for t in args]  # Magi's dispatched order -> packed doc order
+        out_g = magi_msa.undispatch_tokens(out, ctx)
+        cu = list(ctx.cu_seqlens_host)
+        lens = [cu[j + 1] - cu[j] for j in range(len(cu) - 1)]
+        _, gathered, paged, _, _ = fork_prefill(ci, cw, q.contiguous(), k.contiguous(), v.contiguous(), iq.contiguous(), ik.contiguous(), lens)
+        real = cu[ctx.num_real_docs]  # tokens of the real documents (a padding document may follow)
+        assert torch.equal(out_g[:real], paged[:real]), f"layer {i}: {(out_g[:real] != paged[:real]).float().mean().item():.6f} of bytes differ vs SGLang paged"
+        assert torch.equal(gathered[:real], paged[:real])
+    print(f"\nMSA layers {sorted(captured)}: Magi calc_msa_v1 == SGLang CuTe prefill chain bitwise on {len(seq_lens)} packed docs", flush=True)

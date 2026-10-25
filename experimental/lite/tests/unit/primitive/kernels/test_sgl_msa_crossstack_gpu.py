@@ -109,7 +109,11 @@ def test_msa_fork_path_is_deterministic_and_order_only():
     q, k, v, iq, ik, cu, lens = _case([4096, 2048], 9)
     a = _fork(ci, cw, q, k, v, iq, ik, cu, lens)
     b = _fork(ci, cw, q, k, v, iq, ik, cu, lens)
-    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]) and torch.equal(a[3], b[3])
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]) and torch.equal(a[2], b[2])
+    # fp32 block scores: the kernel writes only the causal (past) blocks of each query, the rest of the buffer is uninitialised
+    pos = torch.cat([torch.arange(int(l), device="cuda") for l in lens.tolist()])
+    valid = (torch.arange(a[3].shape[-1], device="cuda")[None, :] <= (pos // BLK)[:, None])[None]
+    assert torch.equal(torch.where(valid, a[3], 0.0), torch.where(valid, b[3], 0.0))
     max_len = int(lens.max())
     perm = torch.argsort(torch.rand(a[0].shape, device="cuda"), dim=-1)
     shuffled = torch.gather(a[0], -1, perm)
