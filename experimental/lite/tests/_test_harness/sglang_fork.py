@@ -205,9 +205,15 @@ def _use_real_jit_utils():
     jit_cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sgl_jit")
     envs._values.update({"SGLANG_JIT_CACHE_DIR": _Env(jit_cache), "SGLANG_JIT_CACHE_KEEP": _Env(None),
                          "SGLANG_JIT_CACHE_DEBUG": _Env(False), "SGLANG_JIT_KERNEL_RUN_FULL_TESTS": _Env(False)})
-    _set_path(sys.modules["sglang.kernels.jit"], [os.path.join(root, "kernels/jit")])
-    for name in [n for n in sys.modules if n.startswith("sglang.kernels.jit.utils")]:
+    for name in [n for n in sys.modules if n == "sglang.kernels.jit" or n.startswith("sglang.kernels.jit.")]:
         del sys.modules[name]
+    jit_dir = os.path.join(root, "kernels/jit")
+    spec = importlib.util.spec_from_file_location("sglang.kernels.jit", os.path.join(jit_dir, "__init__.py"),
+                                                  submodule_search_locations=[jit_dir])  # a real package: find_spec().origin
+    jit = importlib.util.module_from_spec(spec)
+    sys.modules["sglang.kernels.jit"] = jit
+    spec.loader.exec_module(jit)
+    sys.modules["sglang.kernels"].jit = jit
     return importlib.import_module("sglang.kernels.jit.utils")
 
 
@@ -229,6 +235,7 @@ def load_fork_fa4():
     root = fork_root()
     if not os.path.isdir(os.path.join(root, "kernels/ops/attention/flash_attn/cute")):
         pytest.skip("fork vendored FA4 not shipped")
+    _use_real_jit_utils()  # the package resolves its JIT cache dir through the real kernels/jit tree
     _set_path(_module("sglang.kernels.ops.attention"), [os.path.join(root, "kernels/ops/attention")])
     sys.modules["sglang.kernels.ops.attention.fa4_sm120"] = _AttrModule("sglang.kernels.ops.attention.fa4_sm120", {}, lambda name: None)
     sys.modules["sglang.kernels.ops.attention.fa4_sm120.dispatch"] = _AttrModule(
