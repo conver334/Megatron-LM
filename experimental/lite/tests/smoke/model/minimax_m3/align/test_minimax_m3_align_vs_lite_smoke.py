@@ -160,7 +160,8 @@ def test_rmsnorm_switch_runs_and_only_perturbs_by_norm_rounding(magi_cfg, magi_s
     chunk = bundle.chunks[0]
     n_sgl = sum(isinstance(m, SglGemmaRMSNorm) for m in chunk.modules())
     n_moe = sum(1 for layer in chunk.layers if layer.moe is not None)
-    assert n_sgl == n_moe + 1, (n_sgl, n_moe)
+    n_qk = sum(2 + 2 * (getattr(layer.attn, "indexer", None) is not None) for layer in chunk.layers)  # attention (+ indexer) q/k norms
+    assert n_sgl == n_moe + 1 + n_qk, (n_sgl, n_moe, n_qk)
     del bundle, chunk
     torch.cuda.empty_cache()
     align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rmsnorm",)))
@@ -529,10 +530,28 @@ def test_rope_switch_runs_close_to_lite_and_is_visible(magi_cfg, magi_source, di
     assert len(swapped) == n_layers and len(idx) == sum(isinstance(m, SglRopeMSAttention) for m in swapped) > 0
     del bundle, chunk
     torch.cuda.empty_cache()
-    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rope",)))
+    import megatron.lite.model.minimax_m3.align.rope as _R
+    import megatron.lite.primitive.kernels.sgl_rope as _K
+
+    calls = {"n": 0}
+    _orig = _K.sgl_rope
+
+    def _counted(*a, **k):
+        calls["n"] += 1
+        return _orig(*a, **k)
+
+    _K.sgl_rope = _counted
+    if getattr(_R, "sgl_rope", None) is _orig:
+        _R.sgl_rope = _counted
+    try:
+        align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rope",)))
+    finally:
+        _K.sgl_rope = _orig
+        if getattr(_R, "sgl_rope", None) is _counted:
+            _R.sgl_rope = _orig
     rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
     assert torch.isfinite(align["loss"]).all() and rel < 1e-3, rel
-    assert not torch.equal(align["log_probs"], lite["log_probs"]), "the SGLang RoPE table must change the bytes"
+    assert calls["n"] > 0, "the SGLang RoPE kernel must run on every attention layer"
     print(f"\nrope switch: {len(swapped)} attention layers ({len(idx)} indexers) swapped, loss rel diff vs lite {rel:.2e}, "
           f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
 

@@ -16,7 +16,7 @@ from megatron.lite.primitive.modules.attention.msa import MagiCoreAttention, MSA
 
 class SglMSAIndexerMixin:
     """Index projections through one fused DeepGEMM (SGLang ``index_qk_proj``, N = 4*128 + 128), split into q/k;
-    norm and RoPE follow unchanged (TE RMSNorm == gemma_rmsnorm; RoPE through the ``_rope`` seam, so a rope-swapped
+    norm and RoPE follow unchanged (q/k norm is the contract kernel when the ``rmsnorm`` switch is on; RoPE through the ``_rope`` seam, so a rope-swapped
     indexer keeps SGLang's RoPE). Mixed into the module's current class at swap time."""
 
     def index_qk(self, x_normed, freqs, positions=None):

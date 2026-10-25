@@ -1,8 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """SGLang's RoPE as the fork applies it (``RotaryEmbedding.forward_cuda`` -> JIT ``rope.cuh``, neox style): a cos/sin
-table computed on the CPU in fp32 exactly like ``_compute_cos_sin_cache`` (``inv_freq``, ``arange``, ``einsum``,
-``cos``, ``sin``), the first ``rot`` dims of every head rotated in fp32 and stored back as bf16, the rest untouched.
-TE's fused RoPE (the training backward) evaluates cos/sin inside the kernel, so its bytes differ."""
+table computed in fp32 exactly like ``_compute_cos_sin_cache`` (``inv_freq``, ``arange``, ``einsum``, ``cos``, ``sin``)
+on the GPU, where SGLang builds it (the model is constructed under ``torch.device(cuda)``; CPU trig differs in ~17% of
+entries by one ulp), the first ``rot`` dims of every head rotated in fp32 and stored back as bf16, the rest untouched.
+TE's fused RoPE (the training backward) evaluates cos/sin inside the kernel; with the GPU table its bytes coincide on
+the configs measured so far, the explicit table + kernel stays the contract."""
 
 from __future__ import annotations
 
@@ -14,9 +16,9 @@ import triton.language as tl
 
 
 @functools.lru_cache(maxsize=None)
-def _cpu_table(theta: float, rot: int, max_pos: int) -> torch.Tensor:
-    inv_freq = 1.0 / (theta ** (torch.arange(0, rot, 2, dtype=torch.float) / rot))
-    t = torch.arange(max_pos, dtype=torch.float)
+def _table(theta: float, rot: int, max_pos: int, device="cuda") -> torch.Tensor:
+    inv_freq = 1.0 / (theta ** (torch.arange(0, rot, 2, dtype=torch.float, device=device) / rot))
+    t = torch.arange(max_pos, dtype=torch.float, device=device)
     freqs = torch.einsum("i,j -> ij", t, inv_freq)
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1)  # [max_pos, rot] fp32: cos | sin
 
@@ -32,7 +34,7 @@ class CosSinCache:
         need = int(positions.max().item()) + 1 if positions.numel() else 1
         if self.table is None or self.table.shape[0] < need or self.table.device != positions.device:
             size = (need + 4095) // 4096 * 4096
-            self.table = _cpu_table(self.theta, self.rot, size).to(positions.device)
+            self.table = _table(self.theta, self.rot, size, positions.device)
         return self.table
 
 

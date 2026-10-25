@@ -24,15 +24,23 @@ Swap = Callable[..., None]  # (owner, config, ps, **align_opts)
 
 
 def _swap_rmsnorm(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
-    """MoE ``mlp_norm`` and the final ``norm`` hold their weight in ``SglGemmaRMSNorm``; the align forward feeds
-    them through SGLang's fused add+norm (``MiniMaxM3AlignLayer.forward`` / ``MiniMaxM3AlignModel._final_norm``).
-    Norms fused into LayerNormLinear (attention input, dense MLP input) are not touched yet."""
+    """Every standalone Gemma norm runs the contract kernel: MoE ``mlp_norm`` and the final ``norm`` (fed through
+    SGLang's fused add+norm by ``MiniMaxM3AlignLayer.forward`` / ``MiniMaxM3AlignModel._final_norm``) and the
+    attention / indexer q,k norms (SGLang: ``GemmaRMSNorm`` per head). Norms fused into LayerNormLinear
+    (attention input, dense MLP input) are handled by the ``qkv`` / ``dense_mlp`` switches."""
     from megatron.lite.primitive.kernels.sgl_norm import SglGemmaRMSNorm
 
-    for name in ("mlp_norm", "norm"):
-        old = getattr(owner, name, None)
+    def swap(mod: nn.Module | None, name: str) -> None:
+        old = getattr(mod, name, None) if mod is not None else None
         if old is not None:
-            setattr(owner, name, SglGemmaRMSNorm.from_te(old, eps=config.rms_norm_eps))
+            setattr(mod, name, SglGemmaRMSNorm.from_te(old, eps=config.rms_norm_eps))
+
+    for name in ("mlp_norm", "norm"):
+        swap(owner, name)
+    attn = getattr(owner, "attn", None)
+    for mod in (attn, getattr(attn, "indexer", None)):
+        for name in ("q_norm", "k_norm"):
+            swap(mod, name)
 
 
 def _swap_router(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, *, router_gate: str = "fp32", **_opts) -> None:

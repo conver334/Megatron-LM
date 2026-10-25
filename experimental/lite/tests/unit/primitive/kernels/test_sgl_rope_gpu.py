@@ -19,20 +19,22 @@ def _inputs(seed=0, t=T):
     return x, pos
 
 
-def test_table_is_sglang_cpu_recipe_and_cache_grows():
-    from megatron.lite.primitive.kernels.sgl_rope import CosSinCache, _cpu_table
+def test_table_is_sglang_gpu_recipe_and_cache_grows():
+    from megatron.lite.primitive.kernels.sgl_rope import CosSinCache, _table
 
-    inv_freq = 1.0 / (THETA ** (torch.arange(0, ROT, 2, dtype=torch.float) / ROT))  # RotaryEmbedding._compute_inv_freq
-    t = torch.arange(8192, dtype=torch.float)
+    # RotaryEmbedding._compute_inv_freq / _compute_cos_sin_cache, run where SGLang runs them: the model is built under
+    # torch.device("cuda") so arange/einsum/cos/sin execute on the GPU
+    inv_freq = 1.0 / (THETA ** (torch.arange(0, ROT, 2, dtype=torch.float, device="cuda") / ROT))
+    t = torch.arange(8192, dtype=torch.float, device="cuda")
     freqs = torch.einsum("i,j -> ij", t, inv_freq)
     ref = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
-    assert torch.equal(_cpu_table(THETA, ROT, 8192), ref)
-    gpu_freqs = torch.outer(torch.arange(8192, device="cuda", dtype=torch.float32), inv_freq.cuda())
-    print(f"\ncos/sin table CPU (SGLang) vs GPU torch.cos/sin of the same freqs: {(ref.cuda() != torch.cat((gpu_freqs.cos(), gpu_freqs.sin()), -1)).float().mean().item():.4f} differ")
+    assert torch.equal(_table(THETA, ROT, 8192, "cuda"), ref)
+    cpu = _table(THETA, ROT, 8192, "cpu")
+    print(f"\ncos/sin table GPU (SGLang) vs the same recipe on the CPU: {(ref != cpu.cuda()).float().mean().item():.4f} of entries differ")
     cache = CosSinCache(THETA, ROT)
     pos = torch.tensor([5, 4099], device="cuda")
     rows = cache.rows(pos)
-    assert rows.shape[0] == 8192 and torch.equal(rows[:8192], ref.cuda())
+    assert rows.shape[0] == 8192 and torch.equal(rows[:8192], ref)
     assert cache.rows(torch.tensor([3], device="cuda")) is rows  # no regrowth for smaller positions
 
 
