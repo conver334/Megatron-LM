@@ -4,7 +4,9 @@ DeepGEMM runner), one rank at a time: ep_scatter's layout (per-expert runs align
 m-grouped contiguous GEMMs, swigluoai, ep_gather (fp32 routed weight on the bf16 expert output, slot order) -> the
 rank's bf16 partial; the DeepEP combine adds the partials of the ranks holding a slot (intranode: ascending rank in
 fp32, one rounding; internode: each 8-rank node's sum rounded to bf16 first). Experts sit in contiguous blocks of
-E / ep_size per rank (no EPLB)."""
+E / ep_size per rank (no EPLB). The low-latency (decode) variant: per-expert blocks through DeepGEMM's masked grouped
+GEMMs, plain expert outputs in bf16, and DeepEP's LL combine (fp32 fma of bf16 output and routed weight per slot in
+slot order, one rounding)."""
 
 from __future__ import annotations
 
@@ -202,3 +204,91 @@ def fused_experts_deepgemm_ep(hidden: torch.Tensor, w13: torch.Tensor, w2: torch
         partials.append(rank_experts(hidden, w13[r * L:(r + 1) * L], w2[r * L:(r + 1) * L], local_ids, weights, alpha, limit))
         has_slot.append(local.any(dim=1))
     return combine_rank_partials(torch.stack(partials), torch.stack(has_slot))
+
+
+# ---------------- DeepEP low-latency (decode) path: masked grouped GEMMs + LL combine ----------------
+LL_BLOCK = 128  # expert block capacity granularity (num_max_dispatch_tokens_per_rank in DeepEP is a fixed capacity)
+
+
+def ll_expert_blocks(hidden: torch.Tensor, local_ids: torch.Tensor, num_local_experts: int, max_m: int | None = None):
+    """DeepEP LL dispatch layout for one rank: per local expert a block of its tokens (row order free), zero padded to
+    ``max_m`` rows; returns (blocks [L, max_m, H] bf16, masked_m int32 [L], row_index int64 [T, K] (-1 remote))."""
+    T, K = local_ids.shape
+    flat = local_ids.reshape(-1).to(torch.int64)
+    valid = flat >= 0
+    counts = torch.bincount(flat[valid], minlength=num_local_experts)
+    need = int(counts.max().item()) if valid.any() else 0
+    if max_m is None:
+        max_m = max((need + LL_BLOCK - 1) // LL_BLOCK * LL_BLOCK, LL_BLOCK)
+    assert max_m >= need
+    order = torch.argsort(torch.where(valid, flat, flat.new_full((), num_local_experts)), stable=True)[: int(valid.sum().item())]
+    e_sorted = flat[order]
+    row = torch.arange(order.numel(), device=flat.device) - (torch.cumsum(counts, 0) - counts)[e_sorted]
+    blocks = torch.zeros(num_local_experts, max_m, hidden.shape[1], dtype=hidden.dtype, device=hidden.device)
+    blocks[e_sorted, row] = hidden[order // K]
+    row_index = torch.full_like(flat, -1)
+    row_index[order] = row
+    return blocks, counts.to(torch.int32), row_index.view(T, K)
+
+
+def ll_rank_experts(hidden: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, local_ids: torch.Tensor, alpha: float,
+                    limit: float, max_m: int | None = None, expected_m: int | None = None):
+    """One rank of the LL path (the DeepGEMM runner's masked bf16 path): -> per-expert outputs [L, max_m, H] bf16 (rows
+    beyond masked_m are garbage), masked_m, row_index."""
+    dg = deep_gemm_module()
+    L, N, H = w13.shape
+    blocks, masked_m, row_index = ll_expert_blocks(hidden, local_ids, L, max_m)
+    max_m = blocks.shape[1]
+    if expected_m is None:
+        expected_m = max(int(masked_m.float().mean().ceil().item()), 1)
+    gateup = torch.empty(L, max_m, N, dtype=hidden.dtype, device=hidden.device)
+    dg.m_grouped_bf16_gemm_nt_masked(blocks, w13, gateup, masked_m, expected_m)
+    act = swigluoai(gateup.view(-1, N), alpha, limit).view(L, max_m, N // 2)
+    down = torch.empty(L, max_m, H, dtype=hidden.dtype, device=hidden.device)
+    dg.m_grouped_bf16_gemm_nt_masked(act, w2, down, masked_m, expected_m)
+    return down, masked_m, row_index
+
+
+@triton.jit
+def _ll_combine_kernel(out_ptr, exp_ptr, ids_ptr, w_ptr, row_ptr, stride_e, stride_m, H, K: tl.constexpr, BLOCK: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < H
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for k in range(K):
+        e = tl.load(ids_ptr + t * K + k).to(tl.int64)
+        if e >= 0:
+            r = tl.load(row_ptr + t * K + k).to(tl.int64)
+            w = tl.load(w_ptr + t * K + k)
+            x = tl.load(exp_ptr + e * stride_e + r * stride_m + offs, mask=mask, other=0.0).to(tl.float32)
+            acc = tl.fma(x, w, acc)
+    tl.store(out_ptr + t * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def ll_combine(expert_out: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor, row_index: torch.Tensor) -> torch.Tensor:
+    """DeepEP low-latency combine (internode_ll.cu combine / decode_and_accumulate): per token ``acc = 0; for each slot in
+    slot order with an expert: acc = fma(float(bf16 expert output), weight, acc)``; one bf16 rounding. ``expert_out``
+    [E, max_m, H] (global expert index), ``row_index`` [T, K]."""
+    T, K = topk_ids.shape
+    H = expert_out.shape[2]
+    out = torch.empty(T, H, dtype=expert_out.dtype, device=expert_out.device)
+    if T == 0:
+        return out
+    BLOCK = 1024
+    _ll_combine_kernel[(T, triton.cdiv(H, BLOCK))](out, expert_out, topk_ids.to(torch.int64).contiguous(), topk_weights.float().contiguous(),
+                                                   row_index.to(torch.int64).contiguous(), expert_out.stride(0), expert_out.stride(1), H,
+                                                   K=K, BLOCK=BLOCK)
+    return out
+
+
+def fused_experts_deepgemm_ll(hidden: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, topk_weights: torch.Tensor,
+                              topk_ids: torch.Tensor, alpha: float, limit: float, ep_size: int = 1) -> torch.Tensor:
+    """The routed MoE as SGLang's DeepEP low-latency mode computes it: every rank's local experts through the masked
+    DeepGEMM path, DeepEP's LL combine over the token's slots. Per-expert bytes do not depend on the rank split, so the
+    experts run as one grouped launch; ``ep_size`` only fixes the expert ownership checked by the caller."""
+    E = w13.shape[0]
+    if ep_size < 1 or E % ep_size:
+        raise ValueError(f"ep_size={ep_size} must divide the expert count {E}")
+    ids = topk_ids.to(torch.int64)
+    out, _masked, row_index = ll_rank_experts(hidden, w13, w2, ids, alpha, limit)
+    return ll_combine(out, ids, topk_weights, row_index)

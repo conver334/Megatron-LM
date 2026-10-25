@@ -13,14 +13,14 @@ import torch
 
 from megatron.lite.model.minimax_m3.lite.model import M3MoELayer
 from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
-from megatron.lite.primitive.kernels.sgl_deepgemm_moe import fused_experts_deepgemm_ep
+from megatron.lite.primitive.kernels.sgl_deepgemm_moe import fused_experts_deepgemm_ep, fused_experts_deepgemm_ll
 from megatron.lite.primitive.kernels.sgl_fused_moe import COMBINE_MODES, fused_experts_bf16
 from megatron.lite.primitive.kernels.sgl_moe_fused_gate import moe_fused_gate
 from megatron.lite.primitive.kernels.sgl_swiglu import swigluoai
 from megatron.lite.primitive.kernels.visible import visible_forward
 
 SHARED_MODES = ("separate", "fused")
-EXPERTS_PATHS = ("triton", "deepgemm_ep")
+EXPERTS_PATHS = ("triton", "deepgemm_ep", "deepgemm_ll")
 
 
 class SglM3MoELayer(M3MoELayer):
@@ -42,16 +42,17 @@ class SglM3MoELayer(M3MoELayer):
             raise ValueError(f"align experts combine={combine!r}; known: {COMBINE_MODES}")
         if experts not in EXPERTS_PATHS:
             raise ValueError(f"align experts experts={experts!r}; known: {EXPERTS_PATHS}")
-        if (combine == "ep_normal" or experts == "deepgemm_ep") and shared == "fused":
+        ep_path = experts in ("deepgemm_ep", "deepgemm_ll")
+        if (combine == "ep_normal" or ep_path) and shared == "fused":
             raise ValueError("align experts: SGLang fuses the shared expert only with EP=1; use shared='separate' with the EP paths")
-        if (combine == "ep_normal" or experts == "deepgemm_ep") and (ep_size < 1 or module.experts.num_local_experts % ep_size):
+        if (combine == "ep_normal" or ep_path) and (ep_size < 1 or module.experts.num_local_experts % ep_size):
             raise ValueError(f"align experts: ep_size={ep_size} must divide the expert count {module.experts.num_local_experts}")
-        if experts == "deepgemm_ep":
+        if ep_path:
             if ep_size < 2:
-                raise ValueError("align experts: deepgemm_ep is SGLang's DeepEP path, ep_size >= 2 (EP=1 runs the Triton path)")
+                raise ValueError(f"align experts: {experts} is SGLang's DeepEP path, ep_size >= 2 (EP=1 runs the Triton path)")
             if combine == "expert_asc":
-                raise ValueError("align experts: deepgemm_ep combines in DeepEP's rank order; combine must be 'slot' (default) or 'ep_normal'")
-            combine = "ep_normal"
+                raise ValueError(f"align experts: {experts} combines in DeepEP's order; combine must be 'slot' (default)")
+            combine = "ep_normal" if experts == "deepgemm_ep" else "slot"
         if module.dispatcher.ep_size != 1 or module.experts.etp_group is not None:
             raise NotImplementedError("align experts: ep=1 only (the EP combine contract is not fixed yet)")
         if not isinstance(module.router, SglSigmoidTopKRouter):
@@ -84,6 +85,8 @@ class SglM3MoELayer(M3MoELayer):
             w13, w2 = self._stacked_expert_weights()
             if self.align_moe_experts == "deepgemm_ep":
                 routed = fused_experts_deepgemm_ep(x2, w13, w2, scores, ids, alpha, limit, ep_size=self.align_moe_ep_size)
+            elif self.align_moe_experts == "deepgemm_ll":
+                routed = fused_experts_deepgemm_ll(x2, w13, w2, scores, ids, alpha, limit, ep_size=self.align_moe_ep_size)
             else:
                 routed = fused_experts_bf16(x2, w13, w2, scores, ids, alpha, limit, combine=self.align_moe_combine, ep_size=self.align_moe_ep_size)
             shared = linear_bf16(swigluoai(linear_bf16(x2, w13_s), alpha, limit), w2_s)

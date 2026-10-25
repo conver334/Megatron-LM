@@ -407,6 +407,12 @@ def test_experts_swap_in_guards():
         SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ep", ep_size=8, combine="expert_asc")
     m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ep", ep_size=8)
     assert (m.align_moe_experts, m.align_moe_ep_size, m.align_moe_combine) == ("deepgemm_ep", 8, "ep_normal")
+    with pytest.raises(ValueError, match="ep_size >= 2"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ll")
+    with pytest.raises(ValueError, match="EP=1"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ll", ep_size=8, shared="fused")
+    m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ll", ep_size=8)
+    assert (m.align_moe_experts, m.align_moe_combine) == ("deepgemm_ll", "slot")
 
 
 def test_rope_swap_touches_attention_and_indexer(monkeypatch):

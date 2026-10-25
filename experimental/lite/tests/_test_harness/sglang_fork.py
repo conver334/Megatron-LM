@@ -278,7 +278,8 @@ def load_fork_deep_gemm_runner():
             self.__dict__.update(kw)
 
     _module("sglang.srt.layers.moe.token_dispatcher")
-    _module("sglang.srt.layers.moe.token_dispatcher.deepep", DeepEPNormalCombineInput=DeepEPNormalCombineInput)
+    _module("sglang.srt.layers.moe.token_dispatcher.deepep", DeepEPNormalCombineInput=DeepEPNormalCombineInput,
+            DeepEPLLCombineInput=DeepEPNormalCombineInput)
     return load("srt/layers/moe/moe_runner/deep_gemm.py", "sglang.srt.layers.moe.moe_runner.deep_gemm")
 
 

@@ -455,7 +455,8 @@ def test_experts_switch_runs_close_to_lite_and_shared_modes_differ(magi_cfg, mag
           f"log_probs vs lite differ on {(lite['log_probs'] != align['log_probs']).float().mean().item():.3f} of tokens", flush=True)
 
 
-def test_experts_deepgemm_ep_path_runs_close_to_lite_and_differs_from_triton(magi_cfg, magi_source, dist):
+@pytest.mark.parametrize("path", ["deepgemm_ep", "deepgemm_ll"])
+def test_experts_deepgemm_ep_path_runs_close_to_lite_and_differs_from_triton(magi_cfg, magi_source, dist, path):
     """align_moe_experts="deepgemm_ep": MoE layers show SGLang's DeepEP-normal + DeepGEMM bf16 bytes over
     align_moe_ep_size ranks; close to lite (kernel rounding only) and a different contract from the EP=1 Triton path."""
     from megatron.lite.model.minimax_m3.align import protocol as A
@@ -483,12 +484,12 @@ def test_experts_deepgemm_ep_path_runs_close_to_lite_and_differs_from_triton(mag
 
     lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}),
                 pre_roll=True, hooks=_moe_hooks("lite"))
-    cfg = dict(align_modules=("router", "experts"), align_moe_experts="deepgemm_ep", align_moe_ep_size=ep)
+    cfg = dict(align_modules=("router", "experts"), align_moe_experts=path, align_moe_ep_size=ep)
     torch.manual_seed(7)
     bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, **cfg))
     chunk = bundle.chunks[0]
     moes = [m for m in chunk.modules() if isinstance(m, SglM3MoELayer)]
-    assert moes and all((m.align_moe_experts, m.align_moe_ep_size) == ("deepgemm_ep", ep) for m in moes)
+    assert moes and all((m.align_moe_experts, m.align_moe_ep_size) == (path, ep) for m in moes)
     del bundle, chunk
     torch.cuda.empty_cache()
     align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, **cfg), hooks=_moe_hooks("align"))
@@ -504,7 +505,7 @@ def test_experts_deepgemm_ep_path_runs_close_to_lite_and_differs_from_triton(mag
     rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
     assert rel < 1e-3, rel
     assert not torch.equal(y_a, y_t), "DeepEP+DeepGEMM path must not coincide with the Triton EP=1 path"
-    print(f"\nDeepEP+DeepGEMM experts (ep={ep}, {n_exp} experts): {len(moes)} MoE layers swapped, loss rel diff vs lite {rel:.2e}; "
+    print(f"\nDeepEP+DeepGEMM experts ({path}, ep={ep}, {n_exp} experts): {len(moes)} MoE layers swapped, loss rel diff vs lite {rel:.2e}; "
           f"first MoE layer vs lite {(y_l != y_a).float().mean().item():.4f} of bf16 outputs differ (max |d| "
           f"{(y_l.float() - y_a.float()).abs().max().item():.3e}), vs Triton path {(y_t != y_a).float().mean().item():.4f}", flush=True)
 

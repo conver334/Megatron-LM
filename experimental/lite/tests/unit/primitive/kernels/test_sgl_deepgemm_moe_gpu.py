@@ -215,3 +215,116 @@ def test_fused_experts_deepgemm_ep_sanity_and_datums():
         fused_experts_deepgemm_ep(x, w13, w2, weights, ids, ALPHA, LIMIT, ep_size=3)
     with pytest.raises(ValueError, match="multiple"):
         combine_rank_partials(torch.zeros(12, 2, 4, device="cuda", dtype=torch.bfloat16), torch.ones(12, 2, dtype=torch.bool, device="cuda"))
+
+
+# ---------------- low-latency (decode) path ----------------
+def _fork_ll_rank(blocks, masked_m, expected_m, w13_r, w2_r, ids, weights):
+    """The fork's DeepEP-LL runner path by path: pre_permute_deepep_ll_to_deep_gemm -> DeepGemmRunnerCore.run (masked
+    bf16 GEMMs + oai-swiglu) -> post_permute_deep_gemm_to_deepep_ll."""
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+    from sglang_fork import MoeRunnerConfig, load_fork_deep_gemm_runner
+
+    deep_gemm_module()
+    dg = load_fork_deep_gemm_runner()
+    L = w13_r.shape[0]
+    cfg = MoeRunnerConfig(activation="silu", is_gated=True, gemm1_alpha=ALPHA, gemm1_clamp_limit=LIMIT, gate_up_interleaved=False,
+                          interleaved=False, inplace=False, top_k=ids.shape[1], num_experts=L, num_local_experts=L)
+    quant = dg.DeepGemmMoeQuantInfo(w13_weight=w13_r, w2_weight=w2_r, use_fp8=False)
+    state = {}
+    rin = dg.pre_permute_deepep_ll_to_deep_gemm((blocks, None, ids, weights, masked_m, expected_m, None), quant, cfg, state)
+    rout = dg.DeepGemmRunnerCore(cfg).run(rin, quant, state)
+    return dg.post_permute_deep_gemm_to_deepep_ll(rout, quant, cfg, state).hidden_states
+
+
+def _valid_rows(out, masked_m):
+    return torch.cat([out[e, : int(m)] for e, m in enumerate(masked_m.tolist())])
+
+
+@pytest.mark.parametrize("shape", ["unit", "model_width"])
+def test_ll_rank_experts_equals_fork_runner_by_path(shape):
+    """One DeepEP-LL rank: mlite ll_rank_experts == the fork's masked DeepGEMM runner functions on the same expert
+    blocks (valid rows), bitwise."""
+    from megatron.lite.primitive.kernels.sgl_deepgemm_moe import ll_expert_blocks, ll_rank_experts
+
+    if shape == "unit":
+        x, w13, w2, weights, ids = _inputs(21)
+        ep_size, r = 4, 2
+    else:
+        x, w13, w2, weights, ids = _inputs(22, t=1024, h=6144, i_=3072, e=32)
+        ep_size, r = 4, 1
+    e = w13.shape[0]
+    L = e // ep_size
+    ids64 = ids.to(torch.int64)
+    local = (ids64 // L) == r
+    local_ids = torch.where(local, ids64 - r * L, ids64.new_full((), -1))
+    ours, masked_m, _ = ll_rank_experts(x, w13[r * L:(r + 1) * L], w2[r * L:(r + 1) * L], local_ids, ALPHA, LIMIT)
+    blocks, masked_f, _ = ll_expert_blocks(x, local_ids, L, ours.shape[1])  # the dispatch buffer the runner receives
+    assert torch.equal(masked_f, masked_m)
+    theirs = _fork_ll_rank(blocks, masked_m, max(int(masked_m.float().mean().ceil().item()), 1), w13[r * L:(r + 1) * L], w2[r * L:(r + 1) * L], local_ids, weights)
+    a, b = _valid_rows(ours, masked_m), _valid_rows(theirs, masked_m)
+    assert torch.equal(a, b), f"{(a != b).float().mean().item():.5f} of valid rows differ"
+    assert a.abs().max().item() > 0
+
+
+def test_ll_valid_rows_independent_of_padding_expected_m_and_rank_split():
+    from megatron.lite.primitive.kernels.sgl_deepgemm_moe import ll_rank_experts
+
+    x, w13, w2, weights, ids = _inputs(23)
+    ids64 = ids.to(torch.int64)
+    base, m, _ = ll_rank_experts(x, w13, w2, ids64, ALPHA, LIMIT)
+    ref = _valid_rows(base, m)
+    for max_m, exp_m in ((base.shape[1] * 2, 1), (base.shape[1] + 128, 64), (base.shape[1], 300)):
+        out, m2, _ = ll_rank_experts(x, w13, w2, ids64, ALPHA, LIMIT, max_m=max_m, expected_m=exp_m)
+        assert torch.equal(_valid_rows(out, m2), ref), (max_m, exp_m)
+    # the rank split does not change an expert's bytes: experts 8..15 computed as rank 1 of 2 == the same experts in the full launch
+    L = E // 2
+    local = (ids64 // L) == 1
+    out_r, m_r, _ = ll_rank_experts(x, w13[L:], w2[L:], torch.where(local, ids64 - L, ids64.new_full((), -1)), ALPHA, LIMIT)
+    for e in range(L):
+        assert torch.equal(out_r[e, : int(m_r[e])], base[L + e, : int(m[L + e])])
+
+
+def test_ll_combine_is_fma_slot_order():
+    from megatron.lite.primitive.kernels.sgl_deepgemm_moe import ll_combine
+
+    torch.manual_seed(24)
+    T_, M = 64, 32
+    exp = torch.randn(E, M, H, device="cuda", dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device="cuda")[:K] for _ in range(T_)]).to(torch.int64)
+    ids[:5, 1] = -1  # skipped slots
+    rows = torch.randint(0, M, (T_, K), device="cuda", dtype=torch.int64)
+    w = torch.rand(T_, K, device="cuda")
+    out = ll_combine(exp, ids, w, rows)
+    acc = torch.zeros(T_, H, device="cuda", dtype=torch.float64)  # fma emulated exactly in fp64 (bf16 x fp32 products are exact)
+    for k in range(K):
+        live = ids[:, k] >= 0
+        x = exp[ids[:, k].clamp(min=0), rows[:, k]].double() * w[:, k].double()[:, None]
+        acc = torch.where(live[:, None], (acc + x).float().double(), acc)
+    assert torch.equal(out, acc.float().to(torch.bfloat16))
+    # observability: separate multiply-then-add (two roundings) is not what the kernel does
+    acc2 = torch.zeros(T_, H, device="cuda")
+    for k in range(K):
+        live = ids[:, k] >= 0
+        acc2 = torch.where(live[:, None], acc2 + exp[ids[:, k].clamp(min=0), rows[:, k]].float() * w[:, k][:, None], acc2)
+    print(f"\nLL combine fma vs mul-then-add: {(out != acc2.to(torch.bfloat16)).float().mean().item():.4f} of bytes differ")
+
+
+def test_fused_experts_deepgemm_ll_sanity_and_datums():
+    from megatron.lite.primitive.kernels.sgl_deepgemm_moe import fused_experts_deepgemm_ep, fused_experts_deepgemm_ll
+    from megatron.lite.primitive.kernels.sgl_fused_moe import fused_experts_bf16
+
+    x, w13, w2, weights, ids = _inputs(25)
+    ref = torch.zeros(T, H, device="cuda", dtype=torch.float64)
+    for k in range(K):
+        e = ids[:, k].long()
+        gu = torch.einsum("th,tnh->tn", x.double(), w13.double()[e])
+        gate, up = gu.chunk(2, dim=-1)
+        act = gate.clamp(max=LIMIT) * torch.sigmoid(gate.clamp(max=LIMIT) * ALPHA) * (up.clamp(-LIMIT, LIMIT) + 1)
+        ref += torch.einsum("ti,thi->th", act, w2.double()[e]) * weights[:, k].double()[:, None]
+    ll = fused_experts_deepgemm_ll(x, w13, w2, weights, ids, ALPHA, LIMIT, ep_size=4)
+    assert torch.equal(ll, fused_experts_deepgemm_ll(x, w13, w2, weights, ids, ALPHA, LIMIT, ep_size=4))
+    torch.testing.assert_close(ll.double(), ref, rtol=3e-2, atol=3e-2)
+    normal = fused_experts_deepgemm_ep(x, w13, w2, weights, ids, ALPHA, LIMIT, ep_size=4)
+    triton = fused_experts_bf16(x, w13, w2, weights, ids, ALPHA, LIMIT)
+    print(f"\nDeepEP LL path vs normal (ep=4): {(ll != normal).float().mean().item():.4f} of bytes differ; vs Triton EP=1 path "
+          f"{(ll != triton).float().mean().item():.4f}", flush=True)
