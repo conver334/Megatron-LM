@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -30,10 +31,19 @@ class _Env:
         return self.value
 
 
+def _set_path(m, path):
+    """Make ``m`` a package rooted at ``path`` for the import system (``importlib.util.find_spec`` of submodules
+    needs the parent's ``__spec__``)."""
+    m.__path__ = list(path)
+    m.__spec__ = importlib.machinery.ModuleSpec(m.__name__, None, is_package=True)
+    m.__spec__.submodule_search_locations = m.__path__
+    return m
+
+
 class _AttrModule(types.ModuleType):
     def __init__(self, name, values, default):
         super().__init__(name)
-        self.__path__ = []
+        _set_path(self, [])
         self._values, self._default = values, default
 
     def __getattr__(self, name):
@@ -44,7 +54,7 @@ class _AttrModule(types.ModuleType):
 
 def _module(name, **attrs):
     m = types.ModuleType(name)
-    m.__path__ = []
+    _set_path(m, [])
     for k, v in attrs.items():
         setattr(m, k, v)
     sys.modules[name] = m
@@ -167,7 +177,7 @@ def load_fork_fused_moe():
 
     _module("sglang.srt.layers.moe.moe_runner", MoeRunnerConfig=MoeRunnerConfig)
     tu = _module("sglang.srt.layers.moe.moe_runner.triton_utils", get_config=lambda: None)
-    tu.__path__ = [os.path.join(fork_root(), "srt/layers/moe/moe_runner/triton_utils")]  # relative imports hit the fork files
+    _set_path(tu, [os.path.join(fork_root(), "srt/layers/moe/moe_runner/triton_utils")])  # relative imports hit the fork files
     return load("srt/layers/moe/moe_runner/triton_utils/fused_moe.py", "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")
 
 
@@ -195,8 +205,7 @@ def _use_real_jit_utils():
     jit_cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sgl_jit")
     envs._values.update({"SGLANG_JIT_CACHE_DIR": _Env(jit_cache), "SGLANG_JIT_CACHE_KEEP": _Env(None),
                          "SGLANG_JIT_CACHE_DEBUG": _Env(False), "SGLANG_JIT_KERNEL_RUN_FULL_TESTS": _Env(False)})
-    jit = sys.modules["sglang.kernels.jit"]
-    jit.__path__ = [os.path.join(root, "kernels/jit")]
+    _set_path(sys.modules["sglang.kernels.jit"], [os.path.join(root, "kernels/jit")])
     for name in [n for n in sys.modules if n.startswith("sglang.kernels.jit.utils")]:
         del sys.modules[name]
     return importlib.import_module("sglang.kernels.jit.utils")
@@ -220,8 +229,7 @@ def load_fork_fa4():
     root = fork_root()
     if not os.path.isdir(os.path.join(root, "kernels/ops/attention/flash_attn/cute")):
         pytest.skip("fork vendored FA4 not shipped")
-    attn = _module("sglang.kernels.ops.attention")
-    attn.__path__ = [os.path.join(root, "kernels/ops/attention")]
+    _set_path(_module("sglang.kernels.ops.attention"), [os.path.join(root, "kernels/ops/attention")])
     sys.modules["sglang.kernels.ops.attention.fa4_sm120"] = _AttrModule("sglang.kernels.ops.attention.fa4_sm120", {}, lambda name: None)
     sys.modules["sglang.kernels.ops.attention.fa4_sm120.dispatch"] = _AttrModule(
         "sglang.kernels.ops.attention.fa4_sm120.dispatch", {}, lambda name: (lambda *a, **k: None))

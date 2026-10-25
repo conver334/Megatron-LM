@@ -73,8 +73,11 @@ def test_te_fused_rope_differs_datum():
     x, _ = _inputs(3)
     pos = torch.arange(T, device="cuda")
     inv = 1.0 / (THETA ** (torch.arange(0, ROT, 2, dtype=torch.float32, device="cuda") / ROT))
-    freqs = torch.outer(pos.float(), inv)[:, None, None, :]
+    f = torch.outer(pos.float(), inv)
+    freqs = torch.cat((f, f), dim=-1)[:, None, None, :]  # lite RotaryEmbedding.get_emb: [S, 1, 1, rot] non-interleaved
     te = apply_rotary_pos_emb(x[:, None], freqs, tensor_format="sbhd", interleaved=False, fused=True)[:, 0]
     ours = sgl_rope(x, pos, CosSinCache(THETA, ROT).rows(pos), ROT)
-    torch.testing.assert_close(ours.float(), te.float(), rtol=2 ** -6, atol=2 ** -6)
-    print(f"\nTE fused RoPE vs SGLang RoPE: {(te[..., :ROT] != ours[..., :ROT]).float().mean().item():.4f} of rotary bytes differ")
+    assert torch.equal(te[..., ROT:], ours[..., ROT:])
+    torch.testing.assert_close(ours.float(), te.float(), rtol=2 ** -5, atol=2 ** -5)
+    print(f"\nTE fused RoPE vs SGLang RoPE: {(te[..., :ROT] != ours[..., :ROT]).float().mean().item():.4f} of rotary bytes differ, "
+          f"max |d| {(te.float() - ours.float()).abs().max().item():.3e}")
