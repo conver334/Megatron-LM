@@ -214,3 +214,40 @@ def test_abi_controls_pin_the_normalised_statistics_gate():
                            return_temperature_lse=True, partial_dtype=torch.bfloat16)[0]
     assert torch.equal(scale_only, infer) and torch.equal(lse_only, infer)
     assert not torch.equal(both, infer)
+
+
+def test_decode_path_vs_prefill_datum():
+    """C3 datum: the fork's decode kernels (unified JIT indexer, JIT split-KV sparse attention) on the last token of a
+    document vs the prefill chain's row. Top-k selection agrees and decode is deterministic; the attention bytes differ
+    (different kernel arithmetic, num_splits does not close it); the default num_splits follows the batch size so
+    decode is batch-invariant only with num_splits=1."""
+    from msa_xstack import fork_prefill
+    from sglang_fork import load_fork_msa, load_fork_msa_decode
+
+    ci, cw = load_fork_msa()
+    ui, ua = load_fork_msa_decode()
+    q, k, v, iq, ik, cu, lens = _case([4096], 12)
+    T, last, page = 4096, 4095, 128
+    topk_p, _, out_p, _, _ = fork_prefill(ci, cw, q, k, v, iq, ik, [T])
+
+    def decode(bs, num_splits=None):
+        req_to_token = torch.arange(T, device="cuda", dtype=torch.int32).repeat(bs, 1).contiguous()
+        slot_ids = torch.arange(bs, device="cuda", dtype=torch.int64)
+        seq_lens = torch.full((bs,), T, device="cuda", dtype=torch.int32)
+        topk = ui.minimax_m3_indexer_topk(iq[last:last + 1].repeat(bs, 1, 1).contiguous(), ik, req_to_token, slot_ids, seq_lens,
+                                          query_length=1, page_size=page, block_size=BLK, topk=K, init_blocks=0, local_blocks=1, sm_scale=SCALE)
+        out = ua.minimax_m3_sparse_attn(q[last:last + 1].repeat(bs, 1, 1).contiguous(), k, v, req_to_token, topk, slot_ids, seq_lens,
+                                        query_length=1, page_size=page, sm_scale=SCALE, num_splits=num_splits)
+        return topk, out
+
+    topk_d, out_d = decode(1)
+    assert torch.equal(_sets(topk_d[:, 0]), _sets(topk_p[:, last]))  # same block selection
+    assert torch.equal(out_d, decode(1)[1])  # deterministic
+    frac = {ns: (decode(1, ns)[1][0] != out_p[last]).float().mean().item() for ns in (None, 1)}
+    print(f"\ndecode attention vs prefill row (last token): default splits {frac[None]:.4f}, num_splits=1 {frac[1]:.4f} of bytes differ")
+    assert frac[1] > 0, "decode now equals prefill: re-check and update the contract"
+    bs1, bs8 = decode(1)[1][0], decode(8)[1][0]
+    bs1_s1, bs8_s1, bs32_s1 = decode(1, 1)[1][0], decode(8, 1)[1][0], decode(32, 1)[1][0]
+    print(f"decode batch invariance: default splits bs=8 vs bs=1 {(bs8 != bs1).float().mean().item():.4f} differ; "
+          f"num_splits=1: bs=8 {(bs8_s1 != bs1_s1).float().mean().item():.4f}, bs=32 {(bs32_s1 != bs1_s1).float().mean().item():.4f}")
+    assert torch.equal(bs8_s1, bs1_s1) and torch.equal(bs32_s1, bs1_s1)

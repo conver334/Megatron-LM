@@ -312,3 +312,17 @@ def load_fork_msa():
     if not (ci.CUTE_M3_INDEXER_AVAILABLE and cw.CUTE_AVAILABLE and cw.CUTE_PAGED_AVAILABLE and getattr(cw, "CUTE_M3_K2Q_AVAILABLE", True)):
         pytest.skip("fork CuTe MSA paths unavailable in this MM-Sparse-Attention build")
     return ci, cw
+
+
+@functools.lru_cache(maxsize=None)
+def load_fork_msa_decode():
+    """The fork's MSA decode kernels by path (unified JIT indexer and split-KV sparse attention with the Triton merge)."""
+    import importlib
+
+    load_fork_msa()
+    for rel in ("kernels/jit/csrc/minimax/msa_v1/indexer.cuh", "kernels/jit/csrc/minimax/msa_v1/sparse_attn.cuh"):
+        if not os.path.exists(os.path.join(fork_root(), rel)):
+            pytest.skip(f"fork file missing: {rel}")
+    ui = importlib.import_module("sglang.kernels.ops.attention.minimax_sparse.unified_indexer")
+    ua = importlib.import_module("sglang.kernels.ops.attention.minimax_sparse.unified_sparse_attn")
+    return ui, ua
