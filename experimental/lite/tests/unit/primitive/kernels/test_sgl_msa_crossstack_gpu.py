@@ -119,3 +119,40 @@ def test_msa_fork_path_is_deterministic_and_order_only():
     shuffled = torch.gather(a[0], -1, perm)
     out_shuffled, _, _ = cw.cute_topk_sparse_attention(q, k, v, shuffled, cu, cu, max_len, max_len, BLK, K, SCALE)
     assert torch.equal(out_shuffled, a[1])
+
+
+@pytest.mark.parametrize("name", ["packed_1500_2596", "ties_16_way", "long_32768"])
+def test_sgl_msa_prefill_equals_fork_chain(name):
+    """The training-side module (training kernels in the inference ABI) == the fork's paged chain by path."""
+    from megatron.lite.primitive.kernels.sgl_msa import sgl_msa_prefill
+    from sglang_fork import load_fork_msa
+
+    ci, cw = load_fork_msa()
+    lens, seed, ties = CASES[name]
+    q, k, v, iq, ik, cu, lens_t = _case(lens, seed, ties)
+    _, _, paged, _, _ = _fork(ci, cw, q, k, v, iq, ik, cu, lens_t)
+    ours = sgl_msa_prefill(q, k, v, iq, ik, cu.tolist())
+    assert torch.equal(ours, paged)
+
+
+def test_kl_recipe_abi_changes_the_attention_bytes():
+    """Datum: Magi under the MiniMax KL recipe calls the same kernel with lse_temperature_scale=2 and the temperature
+    LSE, which selects the normalised-partial-statistics path; inference (lse 1, raw statistics) differs."""
+    tr_attn = importlib.import_module("msa_v1.attention")
+    from megatron.lite.primitive.kernels.sgl_msa import sgl_msa_prefill
+
+    q, k, v, iq, ik, cu, lens = _case([1500, 2596], 2)
+    infer = sgl_msa_prefill(q, k, v, iq, ik, cu.tolist())
+    tr_idx = importlib.import_module("msa_v1.indexer")
+    max_len = int(lens.max())
+    topk, _ = tr_idx.forward(iq, ik, cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=max_len, max_seqlen_kv=max_len,
+                             lse_temperature=2.0, deterministic=True)  # scores scaled by 1/T: same ranking
+    pages = sum((l + BLK - 1) // BLK for l in lens.tolist())
+    meta = tr_attn.prepare(topk, cu, cu, total_k=int(cu[-1]), total_rows=pages, max_seqlen_q=max_len, max_seqlen_k=max_len,
+                           fragment_indices=None, prepare_kl_schedule=True)
+    out_kl, _, _ = tr_attn.forward(q, k, v, meta, softmax_scale=SCALE, return_softmax_lse=True, lse_temperature_scale=2.0,
+                                   return_temperature_lse=True, partial_dtype=torch.bfloat16)
+    frac = (out_kl != infer).float().mean().item()
+    print(f"\nKL-recipe ABI (lse_temperature_scale 2, temperature LSE) vs inference ABI: {frac:.4f} of bytes differ, "
+          f"max |d| {(out_kl.float() - infer.float()).abs().max().item():.3e}")
+    assert frac > 0  # the msa_core switch exists for this

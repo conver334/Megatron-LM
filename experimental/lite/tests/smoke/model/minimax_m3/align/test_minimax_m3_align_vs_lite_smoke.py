@@ -565,6 +565,13 @@ def test_msa_layers_match_sglang_prefill_path_bitwise(magi_cfg, magi_source, dis
     """Model-level MSA contract: on the proxy forward, every MSA layer's Magi ``calc_msa_v1`` output (indexer + top-k +
     sparse attention on the actual q/k/v/index-q/k) equals the SGLang fork's CuTe prefill chain run by path on the
     same tensors, bitwise, so the MSA core needs no visible switch."""
+
+@pytest.mark.parametrize("recipe", ["minimax_kl", "frozen_indexer"])
+def test_msa_layers_vs_sglang_prefill_path(magi_cfg, magi_source, dist, recipe):
+    """Model-level MSA datum: each MSA layer's Magi ``calc_msa_v1`` output (indexer + top-k + sparse attention on the
+    actual q/k/v/index-q/k) against the SGLang fork's CuTe prefill chain run by path on the same tensors. With a frozen
+    indexer (inference ABI: lse_temperature 1 -> raw partial statistics) the bytes are equal; the MiniMax KL recipe
+    (kl_temperature 2 -> normalised partial statistics) is expected to differ, which is what the msa_core switch repairs."""
     from megatron.lite.model.minimax_m3.lite import protocol as L
     from megatron.lite.primitive.kernels import magi_msa
     from megatron.lite.primitive.modules.attention.msa import MagiCoreAttention
@@ -584,9 +591,12 @@ def test_msa_layers_match_sglang_prefill_path_bitwise(magi_cfg, magi_source, dis
                     lambda m, args, kwargs, out, i=i: captured.__setitem__(i, ([a.detach().clone() for a in args], kwargs["magi_ctx"], out.detach().clone())),
                     with_kwargs=True)
 
-    _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}),
-         pre_roll=True, hooks=install)
+    cfg = {**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}
+    if recipe == "frozen_indexer":
+        cfg.update(msa_indexer_kl_loss_coeff=0.0, msa_indexer_kl_temperature=1.0)
+    _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **cfg), pre_roll=True, hooks=install)
     assert captured, "no MSA layer in the proxy"
+    diffs = {}
     for i, (args, ctx, out) in sorted(captured.items()):
         q, k, v, iq, ik = [magi_msa.undispatch_tokens(t, ctx) for t in args]  # Magi's dispatched order -> packed doc order
         out_g = magi_msa.undispatch_tokens(out, ctx)
@@ -594,6 +604,77 @@ def test_msa_layers_match_sglang_prefill_path_bitwise(magi_cfg, magi_source, dis
         lens = [cu[j + 1] - cu[j] for j in range(len(cu) - 1)]
         _, gathered, paged, _, _ = fork_prefill(ci, cw, q.contiguous(), k.contiguous(), v.contiguous(), iq.contiguous(), ik.contiguous(), lens)
         real = cu[ctx.num_real_docs]  # tokens of the real documents (a padding document may follow)
-        assert torch.equal(out_g[:real], paged[:real]), f"layer {i}: {(out_g[:real] != paged[:real]).float().mean().item():.6f} of bytes differ vs SGLang paged"
         assert torch.equal(gathered[:real], paged[:real])
-    print(f"\nMSA layers {sorted(captured)}: Magi calc_msa_v1 == SGLang CuTe prefill chain bitwise on {len(seq_lens)} packed docs", flush=True)
+        diffs[i] = (out_g[:real] != paged[:real]).float().mean().item()
+    print(f"\n[{recipe}] Magi calc_msa_v1 vs SGLang CuTe prefill chain, bytes differing per MSA layer: "
+          + ", ".join(f"L{i}: {d:.4f}" for i, d in diffs.items()), flush=True)
+    if recipe == "frozen_indexer":
+        assert all(d == 0.0 for d in diffs.values()), diffs
+    else:
+        assert any(d > 0.0 for d in diffs.values()), "KL recipe unexpectedly bitwise: the normalised-stat path did not run"
+
+
+def test_msa_core_switch_shows_sglang_bytes_under_the_kl_recipe(magi_cfg, magi_source, dist):
+    """align_modules=("msa_core",) with the MiniMax KL recipe (ImplConfig defaults): every MSA layer's visible sparse
+    attention output equals the SGLang fork's CuTe prefill chain by path on the same q/k/v/index-q/k, bitwise; the
+    native Magi path (KL, backward) stays, loss close to lite, every parameter still gets a gradient."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.msa import SglMagiCoreAttention
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels import magi_msa
+    from msa_xstack import fork_prefill
+    from sglang_fork import load_fork_msa
+
+    _magi_deps()
+    ci, cw = load_fork_msa()
+    seq_lens = BATCHES["packed"]
+    captured = {}
+
+    def install(chunk):
+        for i, layer in enumerate(chunk.layers):
+            core = getattr(getattr(layer, "attn", None), "core_attn", None)
+            if isinstance(core, SglMagiCoreAttention):
+                core.register_forward_hook(
+                    lambda m, args, kwargs, out, i=i: captured.__setitem__(i, ([a.detach().clone() for a in args], kwargs["magi_ctx"], out.detach().clone())),
+                    with_kwargs=True)
+
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("msa_core",)), hooks=install)
+    assert captured, "no MSA layer swapped"
+    for i, (args, ctx, out) in sorted(captured.items()):
+        q, k, v, iq, ik = [magi_msa.undispatch_tokens(t, ctx) for t in args]
+        out_g = magi_msa.undispatch_tokens(out, ctx)
+        cu = list(ctx.cu_seqlens_host)
+        lens = [cu[j + 1] - cu[j] for j in range(len(cu) - 1)]
+        _, _, paged, _, _ = fork_prefill(ci, cw, q.contiguous(), k.contiguous(), v.contiguous(), iq.contiguous(), ik.contiguous(), lens)
+        real = cu[ctx.num_real_docs]
+        assert torch.equal(out_g[:real], paged[:real]), f"layer {i}: {(out_g[:real] != paged[:real]).float().mean().item():.6f} of bytes differ"
+    rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
+    assert torch.isfinite(align["loss"]).all() and rel < 1e-2, rel
+    assert len(align["grads"]) == len(lite["grads"]) > 0
+    print(f"\nmsa_core switch: {len(captured)} MSA layers show SGLang prefill bytes under the KL recipe; loss rel diff vs lite {rel:.2e}; "
+          f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
+
+
+def test_index_proj_switch_runs_close_to_lite(magi_cfg, magi_source, dist):
+    """align_modules=("index_proj",): the indexer projections show the fused DeepGEMM bytes; loss close to lite."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.msa import SglMSAIndexer
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+
+    _magi_deps()
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("index_proj",)))
+    chunk = bundle.chunks[0]
+    n = sum(isinstance(m, SglMSAIndexer) for m in chunk.modules())
+    assert n == sum(1 for layer in chunk.layers if getattr(getattr(layer, "attn", None), "indexer", None) is not None) > 0
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("index_proj",)))
+    rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
+    assert torch.isfinite(align["loss"]).all() and rel < 1e-2, rel
+    print(f"\nindex_proj switch: {n} indexers swapped, loss rel diff vs lite {rel:.2e}, "
+          f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
