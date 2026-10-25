@@ -141,9 +141,8 @@ def test_kl_recipe_abi_changes_the_attention_bytes():
 
 @pytest.mark.parametrize("name", ["ties_warps_long", "ties_large_radix"])
 def test_exact_ties_across_warps_on_the_radix_path(name):
-    """Ties placed beyond warp 0 on the radix top-k path (129..4096 visible blocks): the fork resolves them by
-    shared-memory atomicAdd arrival order, the training top-k by the lowest block id. Measures whether the selections
-    stay equal and run-to-run stable; a mismatch here is a tie-rule datum, not a kernel defect."""
+    """Ties placed beyond warp 0 on the radix top-k paths (129..4096 visible blocks): with the fork's deterministic
+    lowest-block-id tie rule the selections are run-to-run stable and equal to the training top-k."""
     from sglang_fork import load_fork_msa
 
     ci, cw = load_fork_msa()
@@ -154,12 +153,8 @@ def test_exact_ties_across_warps_on_the_radix_path(name):
     tr_topk, _ = _training(q, k, v, iq, ik, cu, lens_t, sum((l + BLK - 1) // BLK for l in lens))
     same = (_sets(tr_topk) == _sets(runs[0])).all(dim=-1)
     print(f"\n[{name}] fork radix top-k run-to-run stable: {stable}; set equality vs training: {same.float().mean().item():.6f}")
-    if name == "ties_warps_long":
-        # datum (10-25): 26 tied blocks spanning warps at 256 visible blocks -> the fork radix scatters equal keys in
-        # atomicAdd arrival order: not run-to-run stable, 2.4% of rows differ from training's lowest-id rule
-        print("   (fork radix tie selection is arrival-ordered on this path; contract item for the fork)")
-        return
-    assert stable and same.all(), "exact-tie selection differs: record as a tie-rule contract item"
+    # before fork 89d9761e11 the radix paths scattered tied keys in atomicAdd arrival order: unstable, 2.4% of rows off
+    assert stable and same.all(), "exact-tie selection differs: the fork radix needs the lowest-block-id tie rule (fork 89d9761e11)"
 
 
 def test_chunked_prefill_extend_equals_full_prefill():
