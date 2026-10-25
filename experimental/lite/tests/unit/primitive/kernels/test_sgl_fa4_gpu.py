@@ -106,3 +106,42 @@ def test_fork_vendored_fa4_batch_invariant_equals_pip():
     theirs = _run(iface.flash_attn_varlen_func, q, k, v, cu, max(LENS))
     ours = _run(_pip(), q, k, v, cu, max(LENS))
     assert torch.equal(theirs, ours), f"{(theirs != ours).float().mean().item():.5f} of outputs differ"
+
+
+@pytest.mark.parametrize("lens", [[1537, 2561], [5, 4096, 77]])
+def test_pip_fa4_batch_invariance_with_unaligned_lengths(lens):
+    """Odd document lengths: a document's rows must not depend on its neighbours in the packed batch."""
+    fa = _pip()
+    torch.manual_seed(4)
+    n = sum(lens)
+    q = torch.randn(n, HQ, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(n, HK, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(n, HK, D, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), device="cuda", dtype=torch.int32)
+    packed = _run(fa, q, k, v, cu, max(lens))
+    for i in range(len(lens)):
+        lo, hi = int(cu[i]), int(cu[i + 1])
+        alone = _run(fa, q[lo:hi].contiguous(), k[lo:hi].contiguous(), v[lo:hi].contiguous(), torch.tensor([0, hi - lo], device="cuda", dtype=torch.int32), hi - lo)
+        assert torch.equal(alone, packed[lo:hi]), f"doc {i} (len {lens[i]}) alone vs packed: {(alone != packed[lo:hi]).float().mean().item():.4f} differ"
+
+
+def test_pip_fa4_decode_rows_match_prefill_rows():
+    """Decode shape (one query row against its KV prefix, num_splits=1) == the same row inside a prefill call,
+    for every position of a short document: SGLang's prefill/decode agreement is what the training forward relies on."""
+    fa = _pip()
+    torch.manual_seed(5)
+    L = 300
+    q = torch.randn(L, HQ, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(L, HK, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(L, HK, D, device="cuda", dtype=torch.bfloat16)
+    full = _run(fa, q, k, v, torch.tensor([0, L], device="cuda", dtype=torch.int32), L)
+    bad = []
+    for t in range(0, L, 7):
+        out = fa(q[t : t + 1], k[: t + 1].contiguous(), v[: t + 1].contiguous(), cu_seqlens_q=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                 cu_seqlens_k=torch.tensor([0, t + 1], device="cuda", dtype=torch.int32), max_seqlen_q=1, max_seqlen_k=t + 1,
+                 softmax_scale=D ** -0.5, causal=True, num_splits=1)
+        out = out[0] if isinstance(out, tuple) else out
+        if not torch.equal(out[0], full[t]):
+            bad.append((t, (out[0] != full[t]).float().mean().item()))
+    print(f"\npip FA4 decode-row vs prefill-row mismatches at {len(bad)} of {len(range(0, L, 7))} positions: {bad[:6]}")
+    assert not bad
