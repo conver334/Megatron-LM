@@ -292,8 +292,7 @@ def load_fork_msa():
 
     install_stubs()
     root = fork_root()
-    for rel in ("kernels/ops/attention/minimax_sparse/prefill/cute_indexer.py", "kernels/jit/utils/compile/loader.py",
-                "kernels/jit/csrc/minimax/minimax_decode_topk.cuh"):
+    for rel in ("kernels/ops/attention/minimax_sparse/prefill/cute_indexer.py", "kernels/jit/csrc/minimax/minimax_decode_topk.cuh"):
         if not os.path.exists(os.path.join(root, rel)):
             pytest.skip(f"fork file missing: {rel}")
     try:
@@ -301,14 +300,8 @@ def load_fork_msa():
         importlib.import_module("msa_v1.attention")
     except ImportError as exc:
         pytest.skip(f"MM-Sparse-Attention packages missing: {exc}")
-    sys.modules.setdefault("sglang.srt.environ.envs", sys.modules["sglang.srt.environ"].envs)
-    sys.modules["sglang.kernels"].__path__ = [os.path.join(root, "kernels")]
-    for name in [n for n in sys.modules if n.startswith("sglang.kernels.jit")]:
-        del sys.modules[name]
-    importlib.import_module("sglang.kernels.jit")  # the real package: its loader resolves csrc/include from __spec__
     _use_real_jit_utils()
-    attn = _module("sglang.kernels.ops.attention")
-    attn.__path__ = [os.path.join(root, "kernels/ops/attention")]
+    _set_path(_module("sglang.kernels.ops.attention"), [os.path.join(root, "kernels/ops/attention")])
     utils = sys.modules["sglang.srt.utils"]
     utils._values.update({"is_cuda": lambda: True, "is_hip": lambda: False, "is_npu": lambda: False})
     ci = importlib.import_module("sglang.kernels.ops.attention.minimax_sparse.prefill.cute_indexer")
