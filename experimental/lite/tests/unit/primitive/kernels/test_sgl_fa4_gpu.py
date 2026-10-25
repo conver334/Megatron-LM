@@ -145,3 +145,33 @@ def test_pip_fa4_decode_rows_match_prefill_rows():
             bad.append((t, (out[0] != full[t]).float().mean().item()))
     print(f"\npip FA4 decode-row vs prefill-row mismatches at {len(bad)} of {len(range(0, L, 7))} positions: {bad[:6]}")
     assert not bad
+
+
+@pytest.mark.parametrize("split", [128, 150, 257])
+def test_chunked_prefill_rows_match_full_prefill(split):
+    """Chunked prefill (second chunk: seqlen_q < seqlen_k, the causal boundary mid-block) vs one full prefill, for
+    the pip kernel and for the fork kernel with its batch-invariant switch on/off. The fork's switch exists because
+    the plain kernel splits the causal boundary into two passes whose rounding depends on seqlen_q."""
+    bi, iface = _fork()
+    torch.manual_seed(6)
+    L = 400
+    q = torch.randn(L, HQ, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(L, HK, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(L, HK, D, device="cuda", dtype=torch.bfloat16)
+
+    def chunk(fn, **kw):
+        out = fn(q[split:].contiguous(), k, v, cu_seqlens_q=torch.tensor([0, L - split], device="cuda", dtype=torch.int32),
+                 cu_seqlens_k=torch.tensor([0, L], device="cuda", dtype=torch.int32), max_seqlen_q=L - split, max_seqlen_k=L,
+                 softmax_scale=D ** -0.5, causal=True, num_splits=1, **kw)
+        return out[0] if isinstance(out, tuple) else out
+
+    res = {}
+    full = _run(_pip(), q, k, v, torch.tensor([0, L], device="cuda", dtype=torch.int32), L)
+    res["pip"] = (chunk(_pip()) != full[split:]).float().mean().item()
+    for flag in (True, False):
+        bi.set_batch_invariant(flag)
+        full_f = _run(iface.flash_attn_varlen_func, q, k, v, torch.tensor([0, L], device="cuda", dtype=torch.int32), L, num_splits=1)
+        res[f"fork_bi_{flag}"] = (chunk(iface.flash_attn_varlen_func) != full_f[split:]).float().mean().item()
+    print(f"\nchunked prefill (split {split}) vs full, fraction of bytes differing: {res}", flush=True)
+    assert res["fork_bi_True"] == 0.0, "the batch-invariant fork kernel must give the same rows in chunks and in one pass"
+    print(f"plain pip kernel chunk-vs-full mismatch {res['pip']:.5f} (this is what the BI switch repairs)")
