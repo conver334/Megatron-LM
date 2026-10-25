@@ -660,7 +660,7 @@ def test_msa_core_switch_shows_sglang_bytes_under_the_kl_recipe(magi_cfg, magi_s
 def test_index_proj_switch_runs_close_to_lite(magi_cfg, magi_source, dist):
     """align_modules=("index_proj",): the indexer projections show the fused DeepGEMM bytes; loss close to lite."""
     from megatron.lite.model.minimax_m3.align import protocol as A
-    from megatron.lite.model.minimax_m3.align.msa import SglMSAIndexer
+    from megatron.lite.model.minimax_m3.align.msa import SglMSAIndexerMixin
     from megatron.lite.model.minimax_m3.lite import protocol as L
 
     _magi_deps()
@@ -669,7 +669,7 @@ def test_index_proj_switch_runs_close_to_lite(magi_cfg, magi_source, dist):
     torch.manual_seed(7)
     bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("index_proj",)))
     chunk = bundle.chunks[0]
-    n = sum(isinstance(m, SglMSAIndexer) for m in chunk.modules())
+    n = sum(isinstance(m, SglMSAIndexerMixin) for m in chunk.modules())
     assert n == sum(1 for layer in chunk.layers if getattr(getattr(layer, "attn", None), "indexer", None) is not None) > 0
     del bundle, chunk
     torch.cuda.empty_cache()
