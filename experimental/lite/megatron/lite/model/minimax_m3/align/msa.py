@@ -14,16 +14,10 @@ from megatron.lite.primitive.kernels.visible import visible_forward
 from megatron.lite.primitive.modules.attention.msa import MagiCoreAttention, MSAIndexer
 
 
-class SglMSAIndexer(MSAIndexer):
+class SglMSAIndexerMixin:
     """Index projections through one fused DeepGEMM (SGLang ``index_qk_proj``, N = 4*128 + 128), split into q/k;
-    norm and RoPE follow unchanged (TE RMSNorm == gemma_rmsnorm, RoPE via the ``_rope`` seam)."""
-
-    @classmethod
-    def swap_in(cls, module: MSAIndexer) -> "SglMSAIndexer":
-        if module.q_proj.tp_size != 1:
-            raise NotImplementedError("align index_proj: tp=1 only")
-        module.__class__ = cls
-        return module
+    norm and RoPE follow unchanged (TE RMSNorm == gemma_rmsnorm; RoPE through the ``_rope`` seam, so a rope-swapped
+    indexer keeps SGLang's RoPE). Mixed into the module's current class at swap time."""
 
     def index_qk(self, x_normed, freqs, positions=None):
         from megatron.lite.primitive.recompute import is_recomputing
@@ -37,12 +31,28 @@ class SglMSAIndexer(MSAIndexer):
             if not is_recomputing():
                 with torch.no_grad():
                     w = torch.cat([self.q_proj.linear.weight, self.k_proj.weight], dim=0)
-                    fused = linear_bf16(x_normed.reshape(-1, x_normed.shape[-1]), w)
+                    fused = linear_bf16(x_normed.reshape(-1, x_normed.shape[-1]).contiguous(), w)
                 iq = visible_forward(fused[:, :nq].reshape(iq.shape), iq)
                 ik = visible_forward(fused[:, nq:].reshape(ik.shape), ik)
             iq = self._rope(self.q_norm(iq.view(S, B, -1, self.head_dim)), freqs, positions)
             ik = self._rope(self.k_norm(ik.view(S, B, 1, self.head_dim)), freqs, positions)
         return iq, ik
+
+
+_INDEXER_CLASSES: dict[type, type] = {}
+
+
+def swap_in_indexer(module: MSAIndexer) -> MSAIndexer:
+    """Derive from the module's current class so an earlier swap (the rope one) stays in effect."""
+    if module.q_proj.tp_size != 1:
+        raise NotImplementedError("align index_proj: tp=1 only")
+    base = module.__class__
+    if not issubclass(base, SglMSAIndexerMixin):
+        cls = _INDEXER_CLASSES.get(base)
+        if cls is None:
+            cls = _INDEXER_CLASSES[base] = type("Sgl" + base.__name__, (SglMSAIndexerMixin, base), {})
+        module.__class__ = cls
+    return module
 
 
 class SglMagiCoreAttention(MagiCoreAttention):
@@ -66,7 +76,7 @@ class SglMagiCoreAttention(MagiCoreAttention):
 def swap_in_index_proj(attn) -> None:
     indexer = getattr(attn, "indexer", None)
     if indexer is not None:
-        SglMSAIndexer.swap_in(indexer)
+        swap_in_indexer(indexer)
 
 
 def swap_in_msa_core(attn) -> None:

@@ -482,13 +482,27 @@ def test_msa_swaps_touch_indexer_and_core_only(monkeypatch):
 
 def test_sgl_msa_classes_override_only_their_seams():
     from megatron.lite.model.minimax_m3.align import msa as S
+    from megatron.lite.model.minimax_m3.align.rope import SglRopeMSAIndexer
     from megatron.lite.primitive.modules.attention.msa import MagiCoreAttention, MSAIndexer
 
-    assert issubclass(S.SglMSAIndexer, MSAIndexer) and issubclass(S.SglMagiCoreAttention, MagiCoreAttention)
-    assert {k for k in S.SglMSAIndexer.__dict__ if not k.startswith("__")} == {"swap_in", "index_qk"}
+    assert issubclass(S.SglMagiCoreAttention, MagiCoreAttention)
+    assert {k for k in S.SglMSAIndexerMixin.__dict__ if not k.startswith("__")} == {"index_qk"}
     assert {k for k in S.SglMagiCoreAttention.__dict__ if not k.startswith("__")} == {"forward"}
     core = MagiCoreAttention()
     attn = SimpleNamespace(core_attn=core, indexer=None)
     S.swap_in_msa_core(attn)
     S.swap_in_index_proj(attn)
     assert isinstance(core, S.SglMagiCoreAttention)
+    # the indexer swap derives from the current class: a rope-swapped indexer keeps SGLang's _rope
+    for base in (MSAIndexer, SglRopeMSAIndexer):
+        idx = torch.nn.Module.__new__(base)
+        torch.nn.Module.__init__(idx)
+        idx.q_proj = SimpleNamespace(tp_size=1)
+        S.swap_in_indexer(idx)
+        assert isinstance(idx, S.SglMSAIndexerMixin) and isinstance(idx, base) and idx._rope.__func__ is base._rope
+        assert type(S.swap_in_indexer(idx)) is type(idx)  # idempotent
+    with pytest.raises(NotImplementedError):
+        idx = torch.nn.Module.__new__(MSAIndexer)
+        torch.nn.Module.__init__(idx)
+        idx.q_proj = SimpleNamespace(tp_size=2)
+        S.swap_in_indexer(idx)
