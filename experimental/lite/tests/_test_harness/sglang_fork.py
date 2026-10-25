@@ -265,3 +265,39 @@ def load_fork_deep_gemm_runner():
     _module("sglang.srt.layers.moe.token_dispatcher")
     _module("sglang.srt.layers.moe.token_dispatcher.deepep", DeepEPNormalCombineInput=DeepEPNormalCombineInput)
     return load("srt/layers/moe/moe_runner/deep_gemm.py", "sglang.srt.layers.moe.moe_runner.deep_gemm")
+
+
+@functools.lru_cache(maxsize=None)
+def load_fork_msa():
+    """The fork's MiniMax sparse-attention prefill glue by path: ``minimax_sparse/prefill/cute_indexer.py`` (CuTe
+    indexer GEMM from MM-Sparse-Attention ``inference.msa_v1`` + the CUDA radix top-k built by the fork's JIT loader)
+    and ``cute_op_wrapper.py`` (gathered / paged sparse attention over the shared ``msa_v1`` kernels). Returns
+    (cute_indexer, cute_op_wrapper)."""
+    import importlib
+
+    install_stubs()
+    root = fork_root()
+    for rel in ("kernels/ops/attention/minimax_sparse/prefill/cute_indexer.py", "kernels/jit/utils/compile/loader.py",
+                "kernels/jit/csrc/minimax/minimax_decode_topk.cuh"):
+        if not os.path.exists(os.path.join(root, rel)):
+            pytest.skip(f"fork file missing: {rel}")
+    try:
+        importlib.import_module("inference.msa_v1")
+        importlib.import_module("msa_v1.attention")
+    except ImportError as exc:
+        pytest.skip(f"MM-Sparse-Attention packages missing: {exc}")
+    sys.modules.setdefault("sglang.srt.environ.envs", sys.modules["sglang.srt.environ"].envs)
+    sys.modules["sglang.kernels"].__path__ = [os.path.join(root, "kernels")]
+    for name in [n for n in sys.modules if n.startswith("sglang.kernels.jit")]:
+        del sys.modules[name]
+    importlib.import_module("sglang.kernels.jit")  # the real package: its loader resolves csrc/include from __spec__
+    _use_real_jit_utils()
+    attn = _module("sglang.kernels.ops.attention")
+    attn.__path__ = [os.path.join(root, "kernels/ops/attention")]
+    utils = sys.modules["sglang.srt.utils"]
+    utils._values.update({"is_cuda": lambda: True, "is_hip": lambda: False, "is_npu": lambda: False})
+    ci = importlib.import_module("sglang.kernels.ops.attention.minimax_sparse.prefill.cute_indexer")
+    cw = importlib.import_module("sglang.kernels.ops.attention.minimax_sparse.prefill.cute_op_wrapper")
+    if not (ci.CUTE_M3_INDEXER_AVAILABLE and cw.CUTE_AVAILABLE and cw.CUTE_PAGED_AVAILABLE):
+        pytest.skip("fork CuTe MSA paths unavailable in this MM-Sparse-Attention build")
+    return ci, cw
