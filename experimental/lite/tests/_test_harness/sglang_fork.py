@@ -80,6 +80,9 @@ def install_stubs() -> bool:
         "sglang.srt.utils.common", {"get_bool_env_var": _bool_env, "get_dispatch_device_backend": lambda: "CUDA"},
         lambda name: (lambda *a, **k: False))
     _module("sglang.srt.server_args", ServerArgs=object)
+    _module("sglang.srt.utils.custom_op", register_custom_op=lambda *a, **k: (lambda fn: fn))
+    _module("sglang.utils", is_in_ci=lambda: False)
+    _module("sglang.kernel_api_logging", debug_kernel_api=lambda fn: fn)
     import types as _types
     _exec = _types.SimpleNamespace(deterministic=_types.SimpleNamespace(enable_deterministic_inference=True),
                                    moe=_types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False, ep_num_redundant_experts=0))
@@ -123,6 +126,18 @@ def load(rel_path: str, modname: str):
     return mod
 
 
+class MoeRunnerConfig:
+    """The fork's MoeRunnerConfig dataclass defaults (moe_runner/base.py), as a plain object."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(dict(num_experts=None, num_local_experts=None, hidden_size=None, intermediate_size_per_partition=None,
+                                  layer_id=None, top_k=None, num_fused_shared_experts=None, params_dtype=None, routing_method_type=None,
+                                  activation="silu", is_gated=True, apply_router_weight_on_input=False, inplace=True, no_combine=False,
+                                  routed_scaling_factor=None, gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None, swiglu_limit=None,
+                                  interleaved=True, gate_up_interleaved=True, layer=None, use_tp_all_gather_activation=False))
+        self.__dict__.update(kw)
+
+
 @functools.lru_cache(maxsize=None)
 def load_fork_fused_moe():
     """The fork's ``fused_moe.py`` (``fused_experts_impl`` orchestration, M3's bf16 EP=1 path) with the pieces the
@@ -150,14 +165,9 @@ def load_fork_fused_moe():
     _module("sglang.srt.distributed.device_communicators.pynccl_allocator", use_symmetric_memory=lambda *a, **k: contextlib.nullcontext())
     _module("sglang.srt.layers.dp_attention", is_allocation_symmetric=lambda: False)
 
-    class MoeRunnerConfig:
-        def __init__(self, **kw):
-            self.__dict__.update(kw)
-
     _module("sglang.srt.layers.moe.moe_runner", MoeRunnerConfig=MoeRunnerConfig)
     tu = _module("sglang.srt.layers.moe.moe_runner.triton_utils", get_config=lambda: None)
     tu.__path__ = [os.path.join(fork_root(), "srt/layers/moe/moe_runner/triton_utils")]  # relative imports hit the fork files
-    _module("sglang.srt.utils.custom_op", register_custom_op=lambda *a, **k: (lambda fn: fn))
     return load("srt/layers/moe/moe_runner/triton_utils/fused_moe.py", "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")
 
 
@@ -167,3 +177,91 @@ def load_fork_ep_kernels():
     per-rank glue, SGLang's own code."""
     install_stubs()
     return load("kernels/ops/moe/ep_moe_kernels.py", "sglang.kernels.ops.moe.ep_moe_kernels")
+
+
+def _use_real_jit_utils():
+    """Swap the stub ``sglang.kernels.jit.utils`` for the fork's real package (nvcc + ninja + tvm-ffi build of the
+    CUDA JIT kernels); needs the fork tree's kernels/jit (csrc, include, utils) and msgspec."""
+    import importlib
+
+    root = fork_root()
+    if not os.path.isdir(os.path.join(root, "kernels/jit/utils")):
+        pytest.skip("fork kernels/jit tree not shipped")
+    try:
+        import msgspec  # noqa: F401
+    except ImportError:
+        pytest.skip("msgspec missing (fork JIT loader)")
+    envs = sys.modules["sglang.srt.environ.envs"]
+    jit_cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sgl_jit")
+    envs._values.update({"SGLANG_JIT_CACHE_DIR": _Env(jit_cache), "SGLANG_JIT_CACHE_KEEP": _Env(None),
+                         "SGLANG_JIT_CACHE_DEBUG": _Env(False), "SGLANG_JIT_KERNEL_RUN_FULL_TESTS": _Env(False)})
+    jit = sys.modules["sglang.kernels.jit"]
+    jit.__path__ = [os.path.join(root, "kernels/jit")]
+    for name in [n for n in sys.modules if n.startswith("sglang.kernels.jit.utils")]:
+        del sys.modules[name]
+    return importlib.import_module("sglang.kernels.jit.utils")
+
+
+@functools.lru_cache(maxsize=None)
+def load_fork_rope():
+    """The fork's ``kernels/ops/attention/rope.py`` with its real CUDA JIT kernel (``elementwise/rope.cuh``)."""
+    install_stubs()
+    _use_real_jit_utils()
+    return load("kernels/ops/attention/rope.py", "sglang.kernels.ops.attention.rope")
+
+
+@functools.lru_cache(maxsize=None)
+def load_fork_fa4():
+    """The fork's vendored FA4 (``kernels/ops/attention/flash_attn/cute``, CuTe DSL with the batch-invariant switch)
+    as a real package beside pip ``flash_attn.cute``."""
+    import importlib
+
+    install_stubs()
+    root = fork_root()
+    if not os.path.isdir(os.path.join(root, "kernels/ops/attention/flash_attn/cute")):
+        pytest.skip("fork vendored FA4 not shipped")
+    attn = _module("sglang.kernels.ops.attention")
+    attn.__path__ = [os.path.join(root, "kernels/ops/attention")]
+    sys.modules["sglang.kernels.ops.attention.fa4_sm120"] = _AttrModule("sglang.kernels.ops.attention.fa4_sm120", {}, lambda name: None)
+    sys.modules["sglang.kernels.ops.attention.fa4_sm120.dispatch"] = _AttrModule(
+        "sglang.kernels.ops.attention.fa4_sm120.dispatch", {}, lambda name: (lambda *a, **k: None))
+    bi = importlib.import_module("sglang.kernels.ops.attention.flash_attn.cute.batch_invariance")
+    iface = importlib.import_module("sglang.kernels.ops.attention.flash_attn.cute.interface")
+    return bi, iface
+
+
+@functools.lru_cache(maxsize=None)
+def load_fork_deep_gemm_runner():
+    """The fork's ``moe_runner/deep_gemm.py`` (DeepGemmRunnerCore and the deepep_normal pre/post permutes) by path:
+    the swiglu comes from the fork's fused_moe module, ep_scatter/ep_gather from its EP kernels, DeepGEMM from its
+    wrapper; registries, distributed and offloader helpers are no-ops."""
+    import types as _t
+
+    install_stubs()
+    load_fork_fused_moe()
+    load_fork_ep_kernels()
+    try:
+        import einops  # noqa: F401
+    except ImportError:
+        _module("einops", rearrange=None)
+    sys.modules["sglang.kernels.ops.attention.dsv4"] = _AttrModule("sglang.kernels.ops.attention.dsv4", {"silu_and_mul_masked_post_quant": None}, lambda name: None)
+    sys.modules["sglang.kernels.ops.quantization"]._values["per_token_group_quant"] = None
+
+    class MoeRunnerCore:
+        def __init__(self, config):
+            self.config = config
+
+    _module("sglang.srt.layers.moe.moe_runner.base", MoeQuantInfo=type("MoeQuantInfo", (), {}), RunnerInput=type("RunnerInput", (), {}),
+            RunnerOutput=type("RunnerOutput", (), {}), MoeRunnerCore=MoeRunnerCore, MoeRunnerConfig=MoeRunnerConfig,
+            register_pre_permute=lambda *a, **k: (lambda f: f), register_post_permute=lambda *a, **k: (lambda f: f))
+    sys.modules["sglang.srt.layers.moe.utils"]._values["MoeRunnerBackend"] = _t.SimpleNamespace(DEEP_GEMM="deep_gemm")
+    sys.modules["sglang.srt.utils"]._values["dispose_tensor"] = lambda *a, **k: None
+    _module("sglang.srt.utils.offloader", get_offloader=lambda: _t.SimpleNamespace(forbid_copy_engine_usage=False))
+
+    class DeepEPNormalCombineInput:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    _module("sglang.srt.layers.moe.token_dispatcher")
+    _module("sglang.srt.layers.moe.token_dispatcher.deepep", DeepEPNormalCombineInput=DeepEPNormalCombineInput)
+    return load("srt/layers/moe/moe_runner/deep_gemm.py", "sglang.srt.layers.moe.moe_runner.deep_gemm")

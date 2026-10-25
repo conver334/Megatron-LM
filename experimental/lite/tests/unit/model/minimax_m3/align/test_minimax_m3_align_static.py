@@ -401,5 +401,36 @@ def test_experts_swap_in_guards():
         SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="cutlass")
     with pytest.raises(ValueError, match="EP=1"):
         SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), shared="fused", experts="deepgemm_ep", ep_size=8)
+    with pytest.raises(ValueError, match="ep_size >= 2"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ep")
+    with pytest.raises(ValueError, match="rank order"):
+        SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ep", ep_size=8, combine="expert_asc")
     m = SglM3MoELayer.swap_in(fake_moe(SglSigmoidTopKRouter), experts="deepgemm_ep", ep_size=8)
-    assert (m.align_moe_experts, m.align_moe_ep_size) == ("deepgemm_ep", 8)
+    assert (m.align_moe_experts, m.align_moe_ep_size, m.align_moe_combine) == ("deepgemm_ep", 8, "ep_normal")
+
+
+def test_rope_swap_touches_attention_and_indexer(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.model.minimax_m3.align.rope")
+    fake.swap_in = lambda attn, *, theta, rot: seen.append((attn, theta, rot))
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    cfg = SimpleNamespace(rope_theta=5_000_000.0, rotary_dim=64)
+    attn_layer = SimpleNamespace(attn=object())
+    for owner in (attn_layer, SimpleNamespace(attn=None), SimpleNamespace()):
+        M.ALIGN_SWAPS["rope"](owner, cfg, None)
+    assert seen == [(attn_layer.attn, 5_000_000.0, 64)]
+
+
+def test_sgl_rope_classes_override_the_seam_only():
+    from megatron.lite.model.minimax_m3.align import rope as R
+    from megatron.lite.primitive.modules.attention.msa import MSAIndexer, MSAttention
+    from megatron.lite.primitive.modules.gqa import GQAttention
+
+    assert issubclass(R.SglRopeGQAttention, GQAttention) and issubclass(R.SglRopeMSAttention, MSAttention)
+    assert issubclass(R.SglRopeMSAIndexer, MSAIndexer)
+    for cls, base in ((R.SglRopeGQAttention, GQAttention), (R.SglRopeMSAttention, MSAttention), (R.SglRopeMSAIndexer, MSAIndexer)):
+        own = {k for k in R._SglRope.__dict__ if not k.startswith("__")}
+        assert own == {"_rope"} and cls.forward is base.forward
+    assert R.shared_cache(5e6, 64) is R.shared_cache(5e6, 64) and R.shared_cache(5e6, 64) is not R.shared_cache(1e6, 64)

@@ -70,15 +70,18 @@ class MSAIndexer(nn.Module):
             for p in self.parameters():
                 p.requires_grad_(False)
 
-    def index_qk(self, x_normed: torch.Tensor, freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rope(self, x: torch.Tensor, freqs: torch.Tensor, positions: torch.Tensor | None) -> torch.Tensor:
+        return apply_rope_sbhd(x, freqs, fused=self.rope_fusion)
+
+    def index_qk(self, x_normed: torch.Tensor, freqs: torch.Tensor, positions: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """``x_normed`` ``[S, B, hidden]``, ``freqs`` ``[S, 1, 1, rot]`` -> ``iq`` ``[S, B, H_idx, D]``, ``ik`` ``[S, B, 1, D]``."""
         with torch.set_grad_enabled(self.trainable and torch.is_grad_enabled()):
             x_normed = x_normed.detach()
             S, B = x_normed.shape[:2]
             iq = self.q_proj(x_normed).view(S, B, -1, self.head_dim)
             ik = self.k_proj(x_normed).view(S, B, 1, self.head_dim)
-            iq = apply_rope_sbhd(self.q_norm(iq), freqs, fused=self.rope_fusion)
-            ik = apply_rope_sbhd(self.k_norm(ik), freqs, fused=self.rope_fusion)
+            iq = self._rope(self.q_norm(iq), freqs, positions)
+            ik = self._rope(self.k_norm(ik), freqs, positions)
         return iq, ik
 
 
@@ -190,9 +193,9 @@ class MSAttention(GQAttention):
         if B != 1 or T != magi_ctx.local_tokens:
             raise ValueError(f"MSAttention expects [T_local={magi_ctx.local_tokens}, 1, hidden] input, got {tuple(x.shape)}")
         freqs = magi_ctx.rope_freqs_for(self.rotary)  # [T, 1, 1, rot] by doc-local position
-        q = apply_rope_sbhd(self.q_norm(q), freqs, fused=self._rope_fusion)
-        k = apply_rope_sbhd(self.k_norm(k), freqs, fused=self._rope_fusion)
-        iq, ik = self.indexer.index_qk(index_input, freqs)
+        q = self._rope(self.q_norm(q), freqs, magi_ctx.position_ids)
+        k = self._rope(self.k_norm(k), freqs, magi_ctx.position_ids)
+        iq, ik = self.indexer.index_qk(index_input, freqs, magi_ctx.position_ids)
         out = self.core_attn(
             q.squeeze(1).contiguous(),
             k.squeeze(1).contiguous(),

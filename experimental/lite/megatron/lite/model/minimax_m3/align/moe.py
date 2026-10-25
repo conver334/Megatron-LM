@@ -46,6 +46,12 @@ class SglM3MoELayer(M3MoELayer):
             raise ValueError("align experts: SGLang fuses the shared expert only with EP=1; use shared='separate' with the EP paths")
         if (combine == "ep_normal" or experts == "deepgemm_ep") and (ep_size < 1 or module.experts.num_local_experts % ep_size):
             raise ValueError(f"align experts: ep_size={ep_size} must divide the expert count {module.experts.num_local_experts}")
+        if experts == "deepgemm_ep":
+            if ep_size < 2:
+                raise ValueError("align experts: deepgemm_ep is SGLang's DeepEP path, ep_size >= 2 (EP=1 runs the Triton path)")
+            if combine == "expert_asc":
+                raise ValueError("align experts: deepgemm_ep combines in DeepEP's rank order; combine must be 'slot' (default) or 'ep_normal'")
+            combine = "ep_normal"
         if module.dispatcher.ep_size != 1 or module.experts.etp_group is not None:
             raise NotImplementedError("align experts: ep=1 only (the EP combine contract is not fixed yet)")
         if not isinstance(module.router, SglSigmoidTopKRouter):

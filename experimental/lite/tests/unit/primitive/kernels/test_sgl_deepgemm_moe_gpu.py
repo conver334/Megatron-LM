@@ -72,6 +72,27 @@ def _fork_rank_partial(x, w13_r, w2_r, local_ids, weights, perm):
     return gather
 
 
+def _fork_rank_partial_runner(x, w13_r, w2_r, local_ids, weights, perm):
+    """The same rank through the fork's own runner code: pre_permute_deepep_normal_to_deep_gemm ->
+    DeepGemmRunnerCore.run (bf16 contiguous path, oai-swiglu) -> post_permute_deep_gemm_to_deepep_normal."""
+    from megatron.lite.primitive.kernels.sgl_deepgemm import deep_gemm_module
+    from sglang_fork import MoeRunnerConfig, load_fork_deep_gemm_runner
+
+    deep_gemm_module()
+    dg = load_fork_deep_gemm_runner()
+    L = w13_r.shape[0]
+    recv_x, recv_ids, recv_w = x[perm].contiguous(), local_ids[perm].contiguous(), weights[perm].contiguous()
+    counts = torch.bincount(recv_ids[recv_ids >= 0], minlength=L)
+    aligned = ((counts + 127) // 128 * 128).tolist()  # DeepEP's num_recv_tokens_per_expert_list (expert_alignment=128)
+    cfg = MoeRunnerConfig(activation="silu", is_gated=True, gemm1_alpha=ALPHA, gemm1_clamp_limit=LIMIT, gate_up_interleaved=False,
+                          interleaved=False, inplace=False, top_k=recv_ids.shape[1], num_experts=L, num_local_experts=L)
+    quant = dg.DeepGemmMoeQuantInfo(w13_weight=w13_r, w2_weight=w2_r, use_fp8=False)
+    state = {}
+    rin = dg.pre_permute_deepep_normal_to_deep_gemm((recv_x, None, recv_ids, recv_w, aligned, None), quant, cfg, state)
+    rout = dg.DeepGemmRunnerCore(cfg).run(rin, quant, state)
+    return dg.post_permute_deep_gemm_to_deepep_normal(rout, quant, cfg, state).hidden_states
+
+
 def test_ep_gather_kernel_equals_fork_and_launch():
     from megatron.lite.primitive.kernels import sgl_deepgemm_moe as V
 
@@ -89,10 +110,12 @@ def test_ep_gather_kernel_equals_fork_and_launch():
     assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("impl", ["composed", "runner"])
 @pytest.mark.parametrize("shape", ["unit", "model_width"])
-def test_rank_partial_equals_fork_runner_composition(shape):
+def test_rank_partial_equals_fork_runner_composition(shape, impl):
     """One DeepEP rank: mlite rank_experts == the fork's ep_scatter + grouped_gemm_nt_bf16_contig + swigluoai +
-    ep_gather run by path on the rank's tokens in a shuffled arrival order. Bitwise."""
+    ep_gather run by path on the rank's tokens in a shuffled arrival order ("composed": the kernels called as the
+    runner calls them; "runner": the fork's pre_permute / DeepGemmRunnerCore / post_permute functions themselves). Bitwise."""
     from megatron.lite.primitive.kernels.sgl_deepgemm_moe import rank_experts
 
     if shape == "unit":
@@ -109,7 +132,8 @@ def test_rank_partial_equals_fork_runner_composition(shape):
     ours = rank_experts(x, w13[r * L:(r + 1) * L], w2[r * L:(r + 1) * L], local_ids, weights, ALPHA, LIMIT)
     sel = local.any(dim=1).nonzero().flatten()
     perm = sel[torch.randperm(sel.numel(), generator=torch.Generator(device="cuda").manual_seed(0), device="cuda")]
-    theirs = _fork_rank_partial(x, w13[r * L:(r + 1) * L], w2[r * L:(r + 1) * L], local_ids, weights, perm)
+    fork_fn = _fork_rank_partial if impl == "composed" else _fork_rank_partial_runner
+    theirs = fork_fn(x, w13[r * L:(r + 1) * L], w2[r * L:(r + 1) * L], local_ids, weights, perm)
     assert torch.equal(theirs, ours[perm]), f"{(theirs != ours[perm]).float().mean().item():.4f} of the rank's bytes differ"
     assert (ours[~local.any(dim=1)] == 0).all() and ours.abs().max().item() > 0
 
@@ -189,3 +213,5 @@ def test_fused_experts_deepgemm_ep_sanity_and_datums():
           f"{(outs[1] != triton).float().mean().item():.4f}, max |d| {(outs[1].float() - triton.float()).abs().max().item():.3e}", flush=True)
     with pytest.raises(ValueError):
         fused_experts_deepgemm_ep(x, w13, w2, weights, ids, ALPHA, LIMIT, ep_size=3)
+    with pytest.raises(ValueError, match="multiple"):
+        combine_rank_partials(torch.zeros(12, 2, 4, device="cuda", dtype=torch.bfloat16), torch.ones(12, 2, dtype=torch.bool, device="cuda"))

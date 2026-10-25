@@ -93,11 +93,21 @@ def _swap_experts(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, 
 
 # name -> swap, applied to every layer and then to the model (final norm / head live there);
 # keep the keys identical to the C0 inventory rows of docs/train_infer_consistency_plan.md
+def _swap_rope(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """q/k (and index-q/k) RoPE -> SGLang bytes: CPU-built fp32 cos/sin table, fp32 rotate; TE fused RoPE backward."""
+    from megatron.lite.model.minimax_m3.align import rope as R
+
+    attn = getattr(owner, "attn", None)
+    if attn is not None:
+        R.swap_in(attn, theta=config.rope_theta, rot=config.rotary_dim)
+
+
 ALIGN_SWAPS: dict[str, Swap] = {
     "rmsnorm": _swap_rmsnorm,
     "router": _swap_router,
     "o_proj": _swap_o_proj,
     "qkv": _swap_qkv,
+    "rope": _swap_rope,
     "dense_mlp": _swap_dense_mlp,
     "lm_head": _swap_lm_head,
     "experts": _swap_experts,

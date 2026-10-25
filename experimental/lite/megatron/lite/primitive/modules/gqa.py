@@ -223,6 +223,11 @@ class GQAttention(nn.Module):
         self.core_attn = self._build_core_attn(attention_backend)
         self.attention_backend = attention_backend
 
+    def _rope(self, x: torch.Tensor, freqs: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """RoPE on ``[T, 1, H, D]`` by per-token ``freqs`` ``[T, 1, 1, rot]`` (``positions`` are the doc-local positions
+        the rows were taken from; a seam for implementations that index their own tables)."""
+        return apply_rope_sbhd(x, freqs, fused=self._rope_fusion)
+
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
@@ -276,8 +281,8 @@ class GQAttention(nn.Module):
             ):
                 raise ValueError("MagiAttention position_ids exceed the RoPE table.")
             local_freqs = freqs.index_select(0, local_positions)
-            q = apply_rope_sbhd(q[:, None], local_freqs, fused=self._rope_fusion).squeeze(1)
-            k = apply_rope_sbhd(k[:, None], local_freqs, fused=self._rope_fusion).squeeze(1)
+            q = self._rope(q[:, None], local_freqs, local_positions).squeeze(1)
+            k = self._rope(k[:, None], local_freqs, local_positions).squeeze(1)
         elif is_packed:
             max_q = getattr(packed_seq_params, "max_seqlen_q", None)
             max_kv = getattr(packed_seq_params, "max_seqlen_kv", None)

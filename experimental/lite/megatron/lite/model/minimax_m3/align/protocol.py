@@ -66,7 +66,8 @@ class ImplConfig(_lite.ImplConfig):
     align_moe_combine: str = "slot"
     align_moe_ep_size: int = 1
     # expert kernels: "triton" (SGLang EP=1 fused_moe) or "deepgemm_ep" (SGLang DeepEP normal + DeepGEMM bf16 runner
-    # over align_moe_ep_size ranks: ep_scatter layout, m-grouped GEMMs, ep_gather, DeepEP combine)
+    # over align_moe_ep_size >= 2 ranks: ep_scatter layout, m-grouped GEMMs, ep_gather, DeepEP combine; the combine
+    # order is DeepEP's, align_moe_combine must stay "slot" or "ep_normal")
     align_moe_experts: str = "triton"
     # PackedBatch contract (verl_mlite, other protocols): labels/loss_mask arrive unrolled and the protocol rolls
     # them left per document (last token masked). lite does not roll; keep False only for lite-style batches.

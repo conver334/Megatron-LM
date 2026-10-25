@@ -170,6 +170,8 @@ def combine_rank_partials(partials: torch.Tensor, has_slot: torch.Tensor) -> tor
     the token. R <= 8: ascending-rank fp32 sum from +0.0, one bf16 rounding; more ranks: each 8-rank node's sum rounded
     to bf16, nodes added in fp32 from +0.0 and rounded once more."""
     R, T, H = partials.shape
+    if R > RANKS_PER_NODE and R % RANKS_PER_NODE:
+        raise ValueError(f"DeepEP needs num_ranks < {RANKS_PER_NODE} or a multiple of it, got {R}")  # deep_ep.cpp Buffer ctor
     n_nodes = (R + RANKS_PER_NODE - 1) // RANKS_PER_NODE
     acc = torch.zeros(T, H, dtype=torch.float32, device=partials.device)
     for node in range(n_nodes):
@@ -188,8 +190,8 @@ def fused_experts_deepgemm_ep(hidden: torch.Tensor, w13: torch.Tensor, w2: torch
     """The whole routed MoE as SGLang computes it over ep_size DeepEP ranks: hidden [T, H] bf16, w13 [E, 2I, H],
     w2 [E, H, I], weights fp32 [T, K], ids [T, K] -> [T, H] bf16 (before the separate shared-expert add)."""
     E = w13.shape[0]
-    if ep_size < 1 or E % ep_size:
-        raise ValueError(f"ep_size={ep_size} must divide the expert count {E}")
+    if ep_size < 1 or E % ep_size or (ep_size > RANKS_PER_NODE and ep_size % RANKS_PER_NODE):
+        raise ValueError(f"ep_size={ep_size} must divide the expert count {E} and be < {RANKS_PER_NODE} or a multiple of it (DeepEP)")
     L = E // ep_size
     ids = topk_ids.to(torch.int64)
     weights = topk_weights.float().contiguous()

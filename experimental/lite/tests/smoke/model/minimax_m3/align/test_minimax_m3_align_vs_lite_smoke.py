@@ -319,7 +319,7 @@ def test_all_dense_switches_run_close_to_lite(magi_cfg, magi_source, dist):
     print(f"\nall dense switches {DENSE_SWITCHES}: loss rel diff vs lite {rel:.2e}", flush=True)
 
 
-ALL_SWITCHES = ("rmsnorm", "router", "o_proj", "qkv", "dense_mlp", "lm_head", "experts")
+ALL_SWITCHES = ("rmsnorm", "router", "o_proj", "qkv", "rope", "dense_mlp", "lm_head", "experts")
 
 
 def test_all_switches_run_and_report_token_logprob_delta(magi_cfg, magi_source, dist):
@@ -470,7 +470,7 @@ def test_experts_deepgemm_ep_path_runs_close_to_lite_and_differs_from_triton(mag
         pytest.skip(str(exc))
     seq_lens = BATCHES["packed"]
     n_exp = magi_cfg.num_local_experts
-    ep = next(e for e in (8, 4, 2, 1) if n_exp % e == 0)
+    ep = next(e for e in (8, 4, 2) if n_exp % e == 0)
     moe_io = {}
 
     def _moe_hooks(tag):
@@ -507,3 +507,30 @@ def test_experts_deepgemm_ep_path_runs_close_to_lite_and_differs_from_triton(mag
     print(f"\nDeepEP+DeepGEMM experts (ep={ep}, {n_exp} experts): {len(moes)} MoE layers swapped, loss rel diff vs lite {rel:.2e}; "
           f"first MoE layer vs lite {(y_l != y_a).float().mean().item():.4f} of bf16 outputs differ (max |d| "
           f"{(y_l.float() - y_a.float()).abs().max().item():.3e}), vs Triton path {(y_t != y_a).float().mean().item():.4f}", flush=True)
+
+
+def test_rope_switch_runs_close_to_lite_and_is_visible(magi_cfg, magi_source, dist):
+    """align_modules=("rope",): q/k and index-q/k RoPE show SGLang's table + rotate bytes on every attention layer
+    (dense and MSA, the indexer included); loss close to lite; the bytes differ from TE's fused RoPE."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.rope import SglRopeGQAttention, SglRopeMSAIndexer, SglRopeMSAttention
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+
+    _magi_deps()
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("rope",)))
+    chunk = bundle.chunks[0]
+    n_layers = len(chunk.layers)
+    swapped = [m for m in chunk.modules() if isinstance(m, (SglRopeGQAttention, SglRopeMSAttention))]
+    idx = [m for m in chunk.modules() if isinstance(m, SglRopeMSAIndexer)]
+    assert len(swapped) == n_layers and len(idx) == sum(isinstance(m, SglRopeMSAttention) for m in swapped) > 0
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("rope",)))
+    rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
+    assert torch.isfinite(align["loss"]).all() and rel < 1e-3, rel
+    assert not torch.equal(align["log_probs"], lite["log_probs"]), "the SGLang RoPE table must change the bytes"
+    print(f"\nrope switch: {len(swapped)} attention layers ({len(idx)} indexers) swapped, loss rel diff vs lite {rel:.2e}, "
+          f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
