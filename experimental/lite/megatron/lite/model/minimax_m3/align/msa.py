@@ -56,7 +56,10 @@ def swap_in_indexer(module: MSAIndexer) -> MSAIndexer:
 
 
 class SglMagiCoreAttention(MagiCoreAttention):
-    """Visible bytes = SGLang's prefill chain on the packed documents (inference ABI), native = Magi ``calc_msa_v1``."""
+    """Visible bytes = SGLang's prefill chain on the packed documents (inference ABI), native = Magi ``calc_msa_v1``.
+    As every switch, a checkpoint replay returns the native bytes, so the backward differentiates Magi's own
+    forward (its heap top-k and KL-recipe statistics), not the shown bytes; the native indexer breaks exact score
+    ties by position unless ImplConfig.deterministic is set."""
 
     def forward(self, q, k, v, index_q, index_k, *, magi_ctx):
         from megatron.lite.primitive.recompute import is_recomputing
@@ -64,11 +67,16 @@ class SglMagiCoreAttention(MagiCoreAttention):
         native = magi_msa.calc_msa_v1(q, k, v, index_q, index_k, magi_ctx)
         if is_recomputing():
             return native
-        if magi_ctx.cp_size != 1:
-            raise NotImplementedError("align msa_core: cp=1 (the visible path recomputes the packed documents locally)")
         with torch.no_grad():
             packed = [magi_msa.undispatch_tokens(t.detach(), magi_ctx) for t in (q, k, v, index_q, index_k)]
-            out = sgl_msa_prefill(*packed, cu_seqlens=list(magi_ctx.cu_seqlens_host))
+            cu = getattr(magi_ctx, "_sgl_cu_seqlens", None)
+            if cu is None:  # one H2D copy per batch, shared by every MSA layer
+                cu = torch.tensor(magi_ctx.cu_seqlens_host, device=q.device, dtype=torch.int32)
+                try:
+                    object.__setattr__(magi_ctx, "_sgl_cu_seqlens", cu)
+                except (AttributeError, TypeError):
+                    pass
+            out = sgl_msa_prefill(*packed, cu_seqlens=list(magi_ctx.cu_seqlens_host), cu_tensor=cu)
             visible = magi_msa.dispatch_tokens(out, magi_ctx)
         return visible_forward(visible.view_as(native), native)
 
@@ -79,7 +87,9 @@ def swap_in_index_proj(attn) -> None:
         swap_in_indexer(indexer)
 
 
-def swap_in_msa_core(attn) -> None:
+def swap_in_msa_core(attn, cp_size: int = 1) -> None:
     core = getattr(attn, "core_attn", None)
     if isinstance(core, MagiCoreAttention):
+        if cp_size != 1:
+            raise NotImplementedError("align msa_core: cp=1 only (the visible path recomputes the packed documents locally)")
         core.__class__ = SglMagiCoreAttention

@@ -126,7 +126,7 @@ def _swap_msa_core(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState,
 
     attn = getattr(owner, "attn", None)
     if attn is not None:
-        S.swap_in_msa_core(attn)
+        S.swap_in_msa_core(attn, cp_size=getattr(ps, "cp_size", 1))
 
 
 ALIGN_SWAPS: dict[str, Swap] = {

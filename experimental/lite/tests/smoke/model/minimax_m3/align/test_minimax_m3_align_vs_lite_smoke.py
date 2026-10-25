@@ -12,7 +12,7 @@ import torch
 pytestmark = [pytest.mark.gpus(1, min_architecture="blackwell"), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"), pytest.mark.optional]
 
 CHUNK = 512
-BATCHES = {"single": [4096], "packed": [1536, 2560]}
+BATCHES = {"single": [4096], "packed": [1536, 2560], "ragged": [1500, 2596]}
 
 
 def _magi_deps():
@@ -567,8 +567,9 @@ def test_msa_layers_match_sglang_prefill_path_bitwise(magi_cfg, magi_source, dis
     sparse attention on the actual q/k/v/index-q/k) equals the SGLang fork's CuTe prefill chain run by path on the
     same tensors, bitwise, so the MSA core needs no visible switch."""
 
+@pytest.mark.parametrize("batch", ["packed", "ragged"])
 @pytest.mark.parametrize("recipe", ["minimax_kl", "frozen_indexer"])
-def test_msa_layers_vs_sglang_prefill_path(magi_cfg, magi_source, dist, recipe):
+def test_msa_layers_vs_sglang_prefill_path(magi_cfg, magi_source, dist, recipe, batch):
     """Model-level MSA datum: each MSA layer's Magi ``calc_msa_v1`` output (indexer + top-k + sparse attention on the
     actual q/k/v/index-q/k) against the SGLang fork's CuTe prefill chain run by path on the same tensors. With a frozen
     indexer (inference ABI: lse_temperature 1 -> raw partial statistics) the bytes are equal; the MiniMax KL recipe
@@ -581,7 +582,7 @@ def test_msa_layers_vs_sglang_prefill_path(magi_cfg, magi_source, dist, recipe):
 
     _magi_deps()
     ci, cw = load_fork_msa()
-    seq_lens = BATCHES["packed"]
+    seq_lens = BATCHES[batch]
     captured = {}
 
     def install(chunk):
@@ -615,7 +616,8 @@ def test_msa_layers_vs_sglang_prefill_path(magi_cfg, magi_source, dist, recipe):
         assert any(d > 0.0 for d in diffs.values()), "KL recipe unexpectedly bitwise: the normalised-stat path did not run"
 
 
-def test_msa_core_switch_shows_sglang_bytes_under_the_kl_recipe(magi_cfg, magi_source, dist):
+@pytest.mark.parametrize("batch", ["packed", "ragged"])
+def test_msa_core_switch_shows_sglang_bytes_under_the_kl_recipe(magi_cfg, magi_source, dist, batch):
     """align_modules=("msa_core",) with the MiniMax KL recipe (ImplConfig defaults): every MSA layer's visible sparse
     attention output equals the SGLang fork's CuTe prefill chain by path on the same q/k/v/index-q/k, bitwise; the
     native Magi path (KL, backward) stays, loss close to lite, every parameter still gets a gradient."""
@@ -628,7 +630,7 @@ def test_msa_core_switch_shows_sglang_bytes_under_the_kl_recipe(magi_cfg, magi_s
 
     _magi_deps()
     ci, cw = load_fork_msa()
-    seq_lens = BATCHES["packed"]
+    seq_lens = BATCHES[batch]
     captured = {}
 
     def install(chunk):
@@ -658,24 +660,46 @@ def test_msa_core_switch_shows_sglang_bytes_under_the_kl_recipe(magi_cfg, magi_s
           f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
 
 
-def test_index_proj_switch_runs_close_to_lite(magi_cfg, magi_source, dist):
-    """align_modules=("index_proj",): the indexer projections show the fused DeepGEMM bytes; loss close to lite."""
+def test_index_proj_switch_shows_fused_deepgemm_bytes(magi_cfg, magi_source, dist):
+    """align_modules=("index_proj",): every indexer's index-q/k (after norm and RoPE) equals the fused
+    [index_q | index_k] DeepGEMM pushed through the module's own norm and RoPE, bitwise; loss close to lite; the
+    fused-vs-TE projection difference is reported."""
     from megatron.lite.model.minimax_m3.align import protocol as A
     from megatron.lite.model.minimax_m3.align.msa import SglMSAIndexerMixin
     from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.kernels.sgl_deepgemm import linear_bf16
 
     _magi_deps()
     seq_lens = BATCHES["packed"]
     lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    captured = {}
+
+    def install(chunk):
+        for i, layer in enumerate(chunk.layers):
+            idx = getattr(getattr(layer, "attn", None), "indexer", None)
+            if isinstance(idx, SglMSAIndexerMixin):
+                idx.register_forward_hook(
+                    lambda m, args, kwargs, out, i=i: captured.__setitem__(i, (m, [a.detach().clone() if torch.is_tensor(a) else a for a in args],
+                                                                             {k_: (v_.detach().clone() if torch.is_tensor(v_) else v_) for k_, v_ in kwargs.items()},
+                                                                             [o.detach().clone() for o in out])),
+                    with_kwargs=True)
+
     torch.manual_seed(7)
-    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("index_proj",)))
-    chunk = bundle.chunks[0]
-    n = sum(isinstance(m, SglMSAIndexerMixin) for m in chunk.modules())
-    assert n == sum(1 for layer in chunk.layers if getattr(getattr(layer, "attn", None), "indexer", None) is not None) > 0
-    del bundle, chunk
-    torch.cuda.empty_cache()
-    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("index_proj",)))
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("index_proj",)), hooks=install)
+    assert captured, "no indexer swapped"
+    for i, (idx, args, kwargs, (iq, ik)) in sorted(captured.items()):
+        x, freqs = args[0], args[1]
+        positions = args[2] if len(args) > 2 else kwargs.get("positions")
+        S_, B_ = x.shape[:2]
+        with torch.no_grad():
+            w = torch.cat([idx.q_proj.linear.weight, idx.k_proj.weight], 0)
+            fused = linear_bf16(x.reshape(-1, x.shape[-1]).contiguous(), w)
+            nq = idx.num_heads * idx.head_dim
+            iq_ref = idx._rope(idx.q_norm(fused[:, :nq].view(S_, B_, -1, idx.head_dim)), freqs, positions)
+            ik_ref = idx._rope(idx.k_norm(fused[:, nq:].view(S_, B_, 1, idx.head_dim)), freqs, positions)
+            te = torch.cat([idx.q_proj(x).reshape(-1, nq), idx.k_proj(x).reshape(-1, idx.head_dim)], dim=-1)
+        assert torch.equal(iq, iq_ref) and torch.equal(ik, ik_ref), f"layer {i}: indexer outputs are not the fused DeepGEMM bytes"
+        print(f"\nindex_proj layer {i}: fused DeepGEMM vs TE projection differ on {(fused != te).float().mean().item():.4f} of bytes", flush=True)
     rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
     assert torch.isfinite(align["loss"]).all() and rel < 1e-2, rel
-    print(f"\nindex_proj switch: {n} indexers swapped, loss rel diff vs lite {rel:.2e}, "
-          f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
+    print(f"index_proj switch: {len(captured)} indexers, loss rel diff vs lite {rel:.2e}", flush=True)

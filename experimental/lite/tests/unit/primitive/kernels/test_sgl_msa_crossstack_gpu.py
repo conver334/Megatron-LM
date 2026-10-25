@@ -32,20 +32,8 @@ def _case(lens, seed, tie_blocks=None):
     return q, k, v, iq, ik, cu, torch.tensor(lens, device="cuda", dtype=torch.int32)
 
 
-def _paged(x, lens, cu):
-    """Per-document pages of BLK tokens (SGLang's page128 KV layout) and the page table."""
-    nblk = [(l + BLK - 1) // BLK for l in lens]
-    out = torch.zeros(sum(nblk) * BLK, *x.shape[1:], device="cuda", dtype=x.dtype)
-    table = torch.full((len(lens), max(nblk)), -1, device="cuda", dtype=torch.int32)
-    pg = 0
-    for b, l in enumerate(lens):
-        out[pg * BLK: pg * BLK + l] = x[int(cu[b]): int(cu[b + 1])]
-        table[b, : nblk[b]] = torch.arange(pg, pg + nblk[b], device="cuda", dtype=torch.int32)
-        pg += nblk[b]
-    return out, table, sum(nblk)
-
-
 def _training(q, k, v, iq, ik, cu, lens, total_pages):
+    """The training-side spelling (what Magi's MSAv1 backend calls), kept independent of sgl_msa_prefill."""
     tr_idx, tr_attn = importlib.import_module("msa_v1.indexer"), importlib.import_module("msa_v1.attention")
     T, max_len = int(cu[-1]), int(lens.max())
     topk, _ = tr_idx.forward(iq, ik, cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=max_len, max_seqlen_kv=max_len, deterministic=True)
@@ -56,17 +44,9 @@ def _training(q, k, v, iq, ik, cu, lens, total_pages):
 
 
 def _fork(ci, cw, q, k, v, iq, ik, cu, lens):
-    T, max_len = int(cu[-1]), int(lens.max())
-    ik_pages, table, total_pages = _paged(ik, lens.tolist(), cu)
-    ws = ci.prepare_m3_prefill_indexer(cu, lens, total_q=T, max_seqlen_q=max_len, max_seqlen_k=max_len, topk=K, num_index_heads=HI)
-    topk = ci.minimax_m3_cute_prefill_indexer_topk(iq, ik_pages, table, cu, lens, max_seqlen_q=max_len, max_seqlen_k=max_len, topk=K,
-                                                    init_blocks=0, local_blocks=1, sm_scale=SCALE, workspace=ws).clone()
-    gathered, _, _ = cw.cute_topk_sparse_attention(q, k, v, topk, cu, cu, max_len, max_len, BLK, K, SCALE)
-    kc, _, _ = _paged(k, lens.tolist(), cu)
-    vc, _, _ = _paged(v, lens.tolist(), cu)
-    paged, _, _ = cw.cute_paged_topk_sparse_attention(q, kc, vc, topk, table, lens, cu, cu, max_len, max_len, BLK, K, BLK, SCALE,
-                                                      total_seqblocks_k=total_pages)
-    return topk, gathered, paged, ws.score, total_pages
+    from msa_xstack import fork_prefill
+
+    return fork_prefill(ci, cw, q, k, v, iq, ik, lens.tolist())
 
 
 def _sets(t):
@@ -101,8 +81,8 @@ def test_msa_prefill_training_equals_fork(name):
 
 
 def test_msa_fork_path_is_deterministic_and_order_only():
-    """Two runs agree bitwise; the fork's top-k order (not a set) is what reaches the attention CSR, and the attention
-    bytes do not depend on that order."""
+    """Two runs agree bitwise (scores on the written, causal entries); the attention bytes do not depend on the
+    top-k order handed to the CSR builder."""
     from sglang_fork import load_fork_msa
 
     ci, cw = load_fork_msa()
@@ -138,6 +118,7 @@ def test_sgl_msa_prefill_equals_fork_chain(name):
 def test_kl_recipe_abi_changes_the_attention_bytes():
     """Datum: Magi under the MiniMax KL recipe calls the same kernel with lse_temperature_scale=2 and the temperature
     LSE, which selects the normalised-partial-statistics path; inference (lse 1, raw statistics) differs."""
+    pytest.importorskip("msa_v1.attention")
     tr_attn = importlib.import_module("msa_v1.attention")
     from megatron.lite.primitive.kernels.sgl_msa import sgl_msa_prefill
 
@@ -156,3 +137,80 @@ def test_kl_recipe_abi_changes_the_attention_bytes():
     print(f"\nKL-recipe ABI (lse_temperature_scale 2, temperature LSE) vs inference ABI: {frac:.4f} of bytes differ, "
           f"max |d| {(out_kl.float() - infer.float()).abs().max().item():.3e}")
     assert frac > 0  # the msa_core switch exists for this
+
+
+@pytest.mark.parametrize("name", ["ties_warps_long", "ties_large_radix"])
+def test_exact_ties_across_warps_on_the_radix_path(name):
+    """Ties placed beyond warp 0 on the radix top-k path (129..4096 visible blocks): the fork resolves them by
+    shared-memory atomicAdd arrival order, the training top-k by the lowest block id. Measures whether the selections
+    stay equal and run-to-run stable; a mismatch here is a tie-rule datum, not a kernel defect."""
+    from sglang_fork import load_fork_msa
+
+    ci, cw = load_fork_msa()
+    lens, seed, ties = {"ties_warps_long": ([32768], 7, tuple(range(20, 46))), "ties_large_radix": ([70000], 8, tuple(range(513, 540)))}[name]
+    q, k, v, iq, ik, cu, lens_t = _case(lens, seed, ties)
+    runs = [_fork(ci, cw, q, k, v, iq, ik, cu, lens_t)[0] for _ in range(3)]
+    stable = all(torch.equal(_sets(runs[0]), _sets(r)) for r in runs[1:])
+    tr_topk, _ = _training(q, k, v, iq, ik, cu, lens_t, sum((l + BLK - 1) // BLK for l in lens))
+    same = (_sets(tr_topk) == _sets(runs[0])).all(dim=-1)
+    print(f"\n[{name}] fork radix top-k run-to-run stable: {stable}; set equality vs training: {same.float().mean().item():.6f}")
+    assert stable and same.all(), "exact-tie selection differs: record as a tie-rule contract item"
+
+
+def test_chunked_prefill_extend_equals_full_prefill():
+    """The server scores a cached prefix + new chunk (prefix_lens > 0) with the same chain: the new chunk's rows must
+    equal the full-prefill rows (chunked prefill == full prefill), and the full prefill == sgl_msa_prefill."""
+    from megatron.lite.primitive.kernels.sgl_msa import sgl_msa_prefill
+    from msa_xstack import fork_prefill
+    from sglang_fork import load_fork_msa
+
+    ci, cw = load_fork_msa()
+    q, k, v, iq, ik, cu, lens = _case([4096], 10)
+    _, _, full, _, _ = fork_prefill(ci, cw, q, k, v, iq, ik, [4096])
+    assert torch.equal(full, sgl_msa_prefill(q, k, v, iq, ik, [0, 4096]))
+    for split in (2048, 1500):
+        _, _, chunk2, _, _ = fork_prefill(ci, cw, q[split:].contiguous(), k, v, iq[split:].contiguous(), ik, [4096 - split], prefix_lens=[split])
+        frac = (chunk2 != full[split:]).float().mean().item()
+        assert frac == 0.0, f"chunked prefill (prefix {split}) differs from full prefill on {frac:.6f} of bytes"
+
+
+def test_attention_tp_shapes_leave_the_raw_statistics_path_datum():
+    """Datum: with attention TP=4 the server runs the same CuTe kernels on 16 q / 1 kv heads, where the kernel keeps
+    normalised partial statistics instead of raw max/sum; the bytes of those heads differ from the TP=1 run."""
+    from msa_xstack import fork_prefill
+    from sglang_fork import load_fork_msa
+
+    ci, cw = load_fork_msa()
+    q, k, v, iq, ik, cu, lens = _case([4096], 11)
+    topk, _, full, _, _ = fork_prefill(ci, cw, q, k, v, iq, ik, [4096])
+    # rank 0 of attention TP=4: q heads 0..15, kv head 0, index head 0 (its top-k is the same rows of the 4-head run)
+    q0, k0, v0 = q[:, :16].contiguous(), k[:, :1].contiguous(), v[:, :1].contiguous()
+    cu_t = torch.tensor([0, 4096], device="cuda", dtype=torch.int32)
+    out_tp4, _, _ = cw.cute_topk_sparse_attention(q0, k0, v0, topk[:1].contiguous(), cu_t, cu_t, 4096, 4096, BLK, K, SCALE)
+    frac = (out_tp4 != full[:, :16]).float().mean().item()
+    print(f"\nattention TP=4 shape (16 q / 1 kv heads) vs TP=1 bytes of the same heads: {frac:.4f} differ")
+    assert frac > 0, "normalised-statistics path produced the raw-statistics bytes; re-check the kernel gate"
+
+
+def test_abi_controls_pin_the_normalised_statistics_gate():
+    """The raw-vs-normalised gate is `return_temperature_lse and lse_temperature_scale != 1`: either flag alone keeps
+    the inference bytes; both together (the KL recipe) change them."""
+    pytest.importorskip("msa_v1.attention")
+    from megatron.lite.primitive.kernels.sgl_msa import sgl_msa_prefill
+
+    tr_idx, tr_attn = importlib.import_module("msa_v1.indexer"), importlib.import_module("msa_v1.attention")
+    q, k, v, iq, ik, cu, lens = _case([1500, 2596], 2)
+    infer = sgl_msa_prefill(q, k, v, iq, ik, cu.tolist())
+    max_len = int(lens.max())
+    pages = sum((l + BLK - 1) // BLK for l in lens.tolist())
+    topk, _ = tr_idx.forward(iq, ik, cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=max_len, max_seqlen_kv=max_len, deterministic=True)
+    meta = tr_attn.prepare(topk, cu, cu, total_k=int(cu[-1]), total_rows=pages, max_seqlen_q=max_len, max_seqlen_k=max_len,
+                           fragment_indices=None, prepare_kl_schedule=True)
+    scale_only, _ = tr_attn.forward(q, k, v, meta, softmax_scale=SCALE, return_softmax_lse=True, lse_temperature_scale=2.0,
+                                    return_temperature_lse=False, partial_dtype=torch.bfloat16)
+    lse_only = tr_attn.forward(q, k, v, meta, softmax_scale=SCALE, return_softmax_lse=True, lse_temperature_scale=1.0,
+                               return_temperature_lse=True, partial_dtype=torch.bfloat16)[0]
+    both = tr_attn.forward(q, k, v, meta, softmax_scale=SCALE, return_softmax_lse=True, lse_temperature_scale=2.0,
+                           return_temperature_lse=True, partial_dtype=torch.bfloat16)[0]
+    assert torch.equal(scale_only, infer) and torch.equal(lse_only, infer)
+    assert not torch.equal(both, infer)

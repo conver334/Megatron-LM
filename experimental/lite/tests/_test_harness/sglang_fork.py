@@ -307,6 +307,8 @@ def load_fork_msa():
     utils._values.update({"is_cuda": lambda: True, "is_hip": lambda: False, "is_npu": lambda: False})
     ci = importlib.import_module("sglang.kernels.ops.attention.minimax_sparse.prefill.cute_indexer")
     cw = importlib.import_module("sglang.kernels.ops.attention.minimax_sparse.prefill.cute_op_wrapper")
-    if not (ci.CUTE_M3_INDEXER_AVAILABLE and cw.CUTE_AVAILABLE and cw.CUTE_PAGED_AVAILABLE):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MM-Sparse-Attention msa_v1 CuTe kernels are SM100+")
+    if not (ci.CUTE_M3_INDEXER_AVAILABLE and cw.CUTE_AVAILABLE and cw.CUTE_PAGED_AVAILABLE and getattr(cw, "CUTE_M3_K2Q_AVAILABLE", True)):
         pytest.skip("fork CuTe MSA paths unavailable in this MM-Sparse-Attention build")
     return ci, cw
