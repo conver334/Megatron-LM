@@ -51,7 +51,7 @@ class SglM3MoELayer(M3MoELayer):
             if ep_size < 2:
                 raise ValueError(f"align experts: {experts} is SGLang's DeepEP path, ep_size >= 2 (EP=1 runs the Triton path)")
             if combine == "expert_asc":
-                raise ValueError(f"align experts: {experts} combines in DeepEP's order; combine must be 'slot' (default)")
+                raise ValueError(f"align experts: {experts} combines in DeepEP's rank order; combine must be 'slot' (default)")
             combine = "ep_normal" if experts == "deepgemm_ep" else "slot"
         if module.dispatcher.ep_size != 1 or module.experts.etp_group is not None:
             raise NotImplementedError("align experts: ep=1 only (the EP combine contract is not fixed yet)")
