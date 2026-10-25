@@ -13,13 +13,16 @@ def is_arch_support_pdl() -> bool:
     return torch.cuda.get_device_capability()[0] >= 9
 
 
-def get_forward_host(*_a, **_k):  # SM120 dispatch is not vendored
-    raise NotImplementedError("sgl_fa4: SM120 path not vendored")
-
-
-def try_cached_paged_decode(*_a, **_k):
+def get_forward_host(arch: int):
+    """fa4_sm120.dispatch.get_forward_host: an architecture-owned host only on SM120 (not vendored), else None."""
+    if arch // 10 == 12:
+        raise NotImplementedError("sgl_fa4: SM120 forward host not vendored")
     return None
 
 
-def try_cached_varlen(*_a, **_k):
-    return None
+def try_cached_paged_decode(*, arch: int, **_k):
+    return None if get_forward_host(arch) is None else None
+
+
+def try_cached_varlen(*, arch: int, **_k):
+    return None if get_forward_host(arch) is None else None
