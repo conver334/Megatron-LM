@@ -191,7 +191,7 @@ def _use_real_jit_utils():
         import msgspec  # noqa: F401
     except ImportError:
         pytest.skip("msgspec missing (fork JIT loader)")
-    envs = sys.modules["sglang.srt.environ.envs"]
+    envs = sys.modules["sglang.srt.environ"].envs
     jit_cache = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sgl_jit")
     envs._values.update({"SGLANG_JIT_CACHE_DIR": _Env(jit_cache), "SGLANG_JIT_CACHE_KEEP": _Env(None),
                          "SGLANG_JIT_CACHE_DEBUG": _Env(False), "SGLANG_JIT_KERNEL_RUN_FULL_TESTS": _Env(False)})
