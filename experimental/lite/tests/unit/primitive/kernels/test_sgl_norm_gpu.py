@@ -129,3 +129,54 @@ def test_fused_add_backward_matches_fp32_reference():
     for got, ref in ((a.grad, ar.grad), (r.grad, rr.grad)):
         torch.testing.assert_close(got.float(), ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(w.grad.float(), wr.grad, rtol=2e-2, atol=2e-1)
+
+
+def _fork_triton_norms():
+    import importlib.util, os
+
+    root = os.environ.get("SGLANG_FORK_PY")
+    path = os.path.join(root or "", "kernels", "ops", "layernorm", "minimax_m3_rmsnorm.py")
+    if not root or not os.path.exists(path):
+        pytest.skip("SGLANG_FORK_PY (fork python/sglang dir) with kernels/ops/layernorm/minimax_m3_rmsnorm.py not available")
+    spec = importlib.util.spec_from_file_location("fork_minimax_m3_rmsnorm", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("shape", [(4096, 6144), (16384, 128), (7, 3, 6144)])
+def test_contract_norms_match_the_fork_triton_source_bitwise(shape):
+    """The vendored kernels and the fork's minimax_m3_rmsnorm (what the server runs under deterministic inference)."""
+    from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm_kernel, gemma_rmsnorm_kernel
+
+    fork = _fork_triton_norms()
+    torch.manual_seed(3)
+    x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 2
+    r = torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 2
+    w = (torch.rand(shape[-1], device="cuda") - 0.5).to(torch.bfloat16)
+    assert torch.equal(gemma_rmsnorm_kernel()(x, w, 1e-6), fork.gemma_rmsnorm(x, w, 1e-6))
+    hid, res = x.clone(), r.clone()
+    gemma_fused_add_rmsnorm_kernel()(hid, res, w, 1e-6)
+    out, summed = fork.gemma_fused_add_rmsnorm(x, r, w, 1e-6)
+    assert torch.equal(hid, out) and torch.equal(res, summed)
+
+
+def test_contract_fused_add_tracks_the_compiled_inference_kernel_to_rare_ulp_events():
+    """Same math as the compiled sgl_kernel/flashinfer kernel; only rare 1-ulp differences (toolchain-dependent)."""
+    from megatron.lite.primitive.kernels.sgl_norm import gemma_fused_add_rmsnorm_inference_kernel, gemma_fused_add_rmsnorm_kernel
+
+    try:
+        aot = gemma_fused_add_rmsnorm_inference_kernel()
+    except ImportError as exc:
+        pytest.skip(str(exc))
+    torch.manual_seed(4)
+    x = torch.randn(4096, 6144, device="cuda", dtype=torch.bfloat16) * 2
+    r = torch.randn(4096, 6144, device="cuda", dtype=torch.bfloat16) * 2
+    w = (torch.rand(6144, device="cuda") - 0.5).to(torch.bfloat16)
+    h1, r1 = x.clone(), r.clone(); gemma_fused_add_rmsnorm_kernel()(h1, r1, w, 1e-6)
+    h2, r2 = x.clone(), r.clone(); aot(h2, r2, w, 1e-6)
+    assert torch.equal(r1, r2)
+    frac = (h1 != h2).float().mean().item()
+    print(f"\ncontract vs compiled fused-add norm: {frac * 100:.5f}% elements differ")
+    assert frac < 1e-4
+    torch.testing.assert_close(h1.float(), h2.float(), rtol=1e-2, atol=1e-2)

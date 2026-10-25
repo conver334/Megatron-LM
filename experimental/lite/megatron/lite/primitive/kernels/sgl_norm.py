@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Gemma RMSNorm whose forward is the SGLang inference kernel (sgl_kernel ``gemma_rmsnorm`` /
-``gemma_fused_add_rmsnorm``, built from flashinfer ``norm.cu``) and whose backward is the plain fp32 formula.
+"""Gemma RMSNorm whose forward is the SGLang contract kernel (the fork's Triton ``minimax_m3_rmsnorm`` under
+deterministic inference, vendored in ``sgl_norm_triton``) and whose backward is the plain fp32 formula.
 Forward bytes match inference; backward only has to be a correct gradient.
 
 SGLang calls the post-attention and final norms with a residual: the kernel forms ``a + r`` in fp32, normalises
@@ -14,7 +14,26 @@ import torch.nn as nn
 
 
 def gemma_rmsnorm_kernel():
-    """sgl_kernel when importable, else pip flashinfer (same ``norm.cu`` source, JIT against local torch)."""
+    """Contract kernel ``(x, weight, eps) -> out`` (fork Triton source)."""
+    from megatron.lite.primitive.kernels.sgl_norm_triton import gemma_rmsnorm
+
+    return gemma_rmsnorm
+
+
+def gemma_fused_add_rmsnorm_kernel():
+    """Contract kernel with the in-place AOT signature ``(hid, res, weight, eps)``: hid <- normed, res <- bf16(hid + res)."""
+    from megatron.lite.primitive.kernels.sgl_norm_triton import gemma_fused_add_rmsnorm
+
+    def kernel(hid, res, weight, eps):
+        out, summed = gemma_fused_add_rmsnorm(hid, res, weight, eps)
+        hid.copy_(out)
+        res.copy_(summed)
+
+    return kernel
+
+
+def gemma_rmsnorm_inference_kernel():
+    """The compiled inference norm (sgl_kernel, else pip flashinfer): reference only, not byte-stable across toolchains."""
     try:
         from sgl_kernel import gemma_rmsnorm
 
@@ -26,10 +45,10 @@ def gemma_rmsnorm_kernel():
 
         return gemma_rmsnorm
     except ImportError as exc:
-        raise ImportError("align rmsnorm needs sgl_kernel or flashinfer-python (gemma_rmsnorm)") from exc
+        raise ImportError("needs sgl_kernel or flashinfer-python (gemma_rmsnorm)") from exc
 
 
-def gemma_fused_add_rmsnorm_kernel():
+def gemma_fused_add_rmsnorm_inference_kernel():
     try:
         from sgl_kernel import gemma_fused_add_rmsnorm
 
@@ -41,7 +60,7 @@ def gemma_fused_add_rmsnorm_kernel():
 
         return gemma_fused_add_rmsnorm
     except ImportError as exc:
-        raise ImportError("align rmsnorm needs sgl_kernel or flashinfer-python (gemma_fused_add_rmsnorm)") from exc
+        raise ImportError("needs sgl_kernel or flashinfer-python (gemma_fused_add_rmsnorm)") from exc
 
 
 def _rmsnorm_backward(g: torch.Tensor, xf: torch.Tensor, w: torch.Tensor, eps: float):
