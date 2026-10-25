@@ -319,7 +319,7 @@ def test_all_dense_switches_run_close_to_lite(magi_cfg, magi_source, dist):
     print(f"\nall dense switches {DENSE_SWITCHES}: loss rel diff vs lite {rel:.2e}", flush=True)
 
 
-ALL_SWITCHES = ("rmsnorm", "router", "o_proj", "qkv", "rope", "dense_mlp", "lm_head", "experts")
+ALL_SWITCHES = ("rmsnorm", "router", "o_proj", "qkv", "rope", "attn_dense", "dense_mlp", "lm_head", "experts")
 
 
 def test_all_switches_run_and_report_token_logprob_delta(magi_cfg, magi_source, dist):
@@ -533,4 +533,30 @@ def test_rope_switch_runs_close_to_lite_and_is_visible(magi_cfg, magi_source, di
     assert torch.isfinite(align["loss"]).all() and rel < 1e-3, rel
     assert not torch.equal(align["log_probs"], lite["log_probs"]), "the SGLang RoPE table must change the bytes"
     print(f"\nrope switch: {len(swapped)} attention layers ({len(idx)} indexers) swapped, loss rel diff vs lite {rel:.2e}, "
+          f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)
+
+
+def test_attn_dense_switch_runs_close_to_lite_and_is_visible(magi_cfg, magi_source, dist):
+    """align_modules=("attn_dense",): dense layers' core attention shows SGLang's batch-invariant FA4 bytes; MSA layers
+    untouched; loss close to lite and the bytes differ from pip FA4 (the switch is visible)."""
+    from megatron.lite.model.minimax_m3.align import protocol as A
+    from megatron.lite.model.minimax_m3.align.attn_dense import SglFa4DotProductAttention
+    from megatron.lite.model.minimax_m3.lite import protocol as L
+    from megatron.lite.primitive.modules.attention.msa import MSAttention
+
+    _magi_deps()
+    seq_lens = BATCHES["packed"]
+    lite = _run(L, magi_cfg, magi_source, seq_lens, _impl_cfg(L, **{**L.MINIMAX_TRAINING_IMPL, "magi_dense_kernel_backend": _dense_backend()}), pre_roll=True)
+    torch.manual_seed(7)
+    bundle = A.build_model(magi_cfg, impl_cfg=_impl_cfg(A, align_modules=("attn_dense",)))
+    chunk = bundle.chunks[0]
+    dense = [layer for layer in chunk.layers if not isinstance(layer.attn, MSAttention)]
+    assert dense and all(isinstance(layer.attn.core_attn, SglFa4DotProductAttention) for layer in dense)
+    assert not any(isinstance(getattr(layer.attn, "core_attn", None), SglFa4DotProductAttention) for layer in chunk.layers if isinstance(layer.attn, MSAttention))
+    del bundle, chunk
+    torch.cuda.empty_cache()
+    align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("attn_dense",)))
+    rel = ((align["loss"] - lite["loss"]).abs() / lite["loss"].abs()).item()
+    assert torch.isfinite(align["loss"]).all() and rel < 1e-3, rel
+    print(f"\nattn_dense switch: {len(dense)} dense layers swapped, loss rel diff vs lite {rel:.2e}, "
           f"log_probs differ on {(align['log_probs'] != lite['log_probs']).float().mean().item():.3f} of tokens", flush=True)

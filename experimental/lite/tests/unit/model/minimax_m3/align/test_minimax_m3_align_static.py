@@ -434,3 +434,31 @@ def test_sgl_rope_classes_override_the_seam_only():
         own = {k for k in R._SglRope.__dict__ if not k.startswith("__")}
         assert own == {"_rope"} and cls.forward is base.forward
     assert R.shared_cache(5e6, 64) is R.shared_cache(5e6, 64) and R.shared_cache(5e6, 64) is not R.shared_cache(1e6, 64)
+
+
+def test_attn_dense_swap_touches_dense_layers_only(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+    from megatron.lite.primitive.modules.attention.msa import MSAttention
+
+    seen = []
+    fake = ModuleType("megatron.lite.model.minimax_m3.align.attn_dense")
+    fake.SglFa4DotProductAttention = SimpleNamespace(swap_in=lambda core: seen.append(core))
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    dense = SimpleNamespace(attn=SimpleNamespace(core_attn=object()))
+    msa = SimpleNamespace(attn=MSAttention.__new__(MSAttention))
+    for owner in (dense, msa, SimpleNamespace(attn=None), SimpleNamespace()):
+        M.ALIGN_SWAPS["attn_dense"](owner, SimpleNamespace(), None)
+    assert seen == [dense.attn.core_attn]
+
+
+def test_sgl_fa4_core_attention_overrides_forward_only():
+    from megatron.lite.model.minimax_m3.align.attn_dense import SglFa4DotProductAttention
+    from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
+
+    assert issubclass(SglFa4DotProductAttention, MagiDotProductAttention)
+    own = {k for k in SglFa4DotProductAttention.__dict__ if not k.startswith("__")}
+    assert own == {"forward", "swap_in"}
+    with pytest.raises(NotImplementedError):
+        SglFa4DotProductAttention.swap_in(torch.nn.Identity())
+    core = MagiDotProductAttention(128)
+    assert SglFa4DotProductAttention.swap_in(core) is core and isinstance(core, SglFa4DotProductAttention)

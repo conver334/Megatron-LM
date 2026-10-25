@@ -175,3 +175,26 @@ def test_chunked_prefill_rows_match_full_prefill(split):
     print(f"\nchunked prefill (split {split}) vs full, fraction of bytes differing: {res}", flush=True)
     assert res["fork_bi_True"] == 0.0, "the batch-invariant fork kernel must give the same rows in chunks and in one pass"
     print(f"plain pip kernel chunk-vs-full mismatch {res['pip']:.5f} (this is what the BI switch repairs)")
+
+
+def test_vendored_sgl_fa4_equals_fork_bi_kernel_and_pip_when_off():
+    """mlite's vendored copy (sgl_fa4) == the fork's FA4 by path with the batch-invariant switch on, bitwise; with its
+    own switch off it equals pip FA4 (the vendored base is the pip base)."""
+    from megatron.lite.primitive.kernels.sgl_fa4 import flash_attn_varlen_bi
+    from megatron.lite.primitive.kernels.sgl_fa4.cute import batch_invariance as our_bi
+    from megatron.lite.primitive.kernels.sgl_fa4.cute.interface import flash_attn_varlen_func as ours_fn
+
+    bi, iface = _fork()
+    q, k, v, cu = _inputs(7)
+    bi.set_batch_invariant(True)
+    theirs = _run(iface.flash_attn_varlen_func, q, k, v, cu, max(LENS), num_splits=1)
+    ours = flash_attn_varlen_bi(q, k, v, cu, D ** -0.5, max(LENS))
+    assert torch.equal(ours, theirs), f"{(ours != theirs).float().mean().item():.5f} differ"
+    assert torch.equal(ours, flash_attn_varlen_bi(q, k, v, cu, D ** -0.5))  # max_seqlen inferred
+    pip = _run(_pip(), q, k, v, cu, max(LENS))
+    assert not torch.equal(ours, pip)
+    our_bi.set_batch_invariant(False)
+    try:
+        assert torch.equal(_run(ours_fn, q, k, v, cu, max(LENS), num_splits=1), pip)
+    finally:
+        our_bi.set_batch_invariant(True)

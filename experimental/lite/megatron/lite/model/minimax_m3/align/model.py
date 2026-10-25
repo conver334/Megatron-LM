@@ -102,12 +102,23 @@ def _swap_rope(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_
         R.swap_in(attn, theta=config.rope_theta, rot=config.rotary_dim)
 
 
+def _swap_attn_dense(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """Dense layers' core attention -> SGLang's batch-invariant FA4 forward bytes; pip FA4 graph stays the backward."""
+    from megatron.lite.model.minimax_m3.align.attn_dense import SglFa4DotProductAttention
+    from megatron.lite.primitive.modules.attention.msa import MSAttention
+
+    attn = getattr(owner, "attn", None)
+    if attn is not None and not isinstance(attn, MSAttention):
+        SglFa4DotProductAttention.swap_in(attn.core_attn)
+
+
 ALIGN_SWAPS: dict[str, Swap] = {
     "rmsnorm": _swap_rmsnorm,
     "router": _swap_router,
     "o_proj": _swap_o_proj,
     "qkv": _swap_qkv,
     "rope": _swap_rope,
+    "attn_dense": _swap_attn_dense,
     "dense_mlp": _swap_dense_mlp,
     "lm_head": _swap_lm_head,
     "experts": _swap_experts,
