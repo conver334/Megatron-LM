@@ -434,3 +434,34 @@ def test_sgl_rope_classes_override_the_seam_only():
         own = {k for k in R._SglRope.__dict__ if not k.startswith("__")}
         assert own == {"_rope"} and cls.forward is base.forward
     assert R.shared_cache(5e6, 64) is R.shared_cache(5e6, 64) and R.shared_cache(5e6, 64) is not R.shared_cache(1e6, 64)
+
+
+def test_msa_swaps_touch_indexer_and_core_only(monkeypatch):
+    from megatron.lite.model.minimax_m3.align import model as M
+
+    seen = []
+    fake = ModuleType("megatron.lite.model.minimax_m3.align.msa")
+    fake.swap_in_index_proj = lambda attn: seen.append(("index_proj", attn))
+    fake.swap_in_msa_core = lambda attn: seen.append(("msa_core", attn))
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    layer = SimpleNamespace(attn=object())
+    for owner in (layer, SimpleNamespace(attn=None), SimpleNamespace()):
+        M.ALIGN_SWAPS["index_proj"](owner, SimpleNamespace(), None)
+        M.ALIGN_SWAPS["msa_core"](owner, SimpleNamespace(), None)
+    assert seen == [("index_proj", layer.attn), ("msa_core", layer.attn)]
+    keys = list(M.ALIGN_SWAPS)
+    assert keys.index("rope") < keys.index("index_proj") < keys.index("msa_core")
+
+
+def test_sgl_msa_classes_override_only_their_seams():
+    from megatron.lite.model.minimax_m3.align import msa as S
+    from megatron.lite.primitive.modules.attention.msa import MagiCoreAttention, MSAIndexer
+
+    assert issubclass(S.SglMSAIndexer, MSAIndexer) and issubclass(S.SglMagiCoreAttention, MagiCoreAttention)
+    assert {k for k in S.SglMSAIndexer.__dict__ if not k.startswith("__")} == {"swap_in", "index_qk"}
+    assert {k for k in S.SglMagiCoreAttention.__dict__ if not k.startswith("__")} == {"forward"}
+    core = MagiCoreAttention()
+    attn = SimpleNamespace(core_attn=core, indexer=None)
+    S.swap_in_msa_core(attn)
+    S.swap_in_index_proj(attn)
+    assert isinstance(core, S.SglMagiCoreAttention)

@@ -102,12 +102,32 @@ def _swap_rope(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_
         R.swap_in(attn, theta=config.rope_theta, rot=config.rotary_dim)
 
 
+def _swap_index_proj(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """MSA indexer q/k projections -> SGLang's fused [index_q | index_k] DeepGEMM bytes; TE backward."""
+    from megatron.lite.model.minimax_m3.align import msa as S
+
+    attn = getattr(owner, "attn", None)
+    if attn is not None:
+        S.swap_in_index_proj(attn)
+
+
+def _swap_msa_core(owner: nn.Module, config: MiniMaxM3Config, ps: ParallelState, **_opts) -> None:
+    """MSA indexer scores + top-k + block-sparse attention -> SGLang prefill bytes (inference ABI); Magi backward/KL."""
+    from megatron.lite.model.minimax_m3.align import msa as S
+
+    attn = getattr(owner, "attn", None)
+    if attn is not None:
+        S.swap_in_msa_core(attn)
+
+
 ALIGN_SWAPS: dict[str, Swap] = {
     "rmsnorm": _swap_rmsnorm,
     "router": _swap_router,
     "o_proj": _swap_o_proj,
     "qkv": _swap_qkv,
     "rope": _swap_rope,
+    "index_proj": _swap_index_proj,
+    "msa_core": _swap_msa_core,
     "dense_mlp": _swap_dense_mlp,
     "lm_head": _swap_lm_head,
     "experts": _swap_experts,
