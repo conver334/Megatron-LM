@@ -677,12 +677,16 @@ def test_index_proj_switch_shows_fused_deepgemm_bytes(magi_cfg, magi_source, dis
     def install(chunk):
         for i, layer in enumerate(chunk.layers):
             idx = getattr(getattr(layer, "attn", None), "indexer", None)
-            if isinstance(idx, SglMSAIndexerMixin):
-                idx.register_forward_hook(
-                    lambda m, args, kwargs, out, i=i: captured.__setitem__(i, (m, [a.detach().clone() if torch.is_tensor(a) else a for a in args],
-                                                                             {k_: (v_.detach().clone() if torch.is_tensor(v_) else v_) for k_, v_ in kwargs.items()},
-                                                                             [o.detach().clone() for o in out])),
-                    with_kwargs=True)
+            if isinstance(idx, SglMSAIndexerMixin):  # index_qk is a plain method (not forward): wrap it on the instance
+
+                def wrapped(*args, _idx=idx, _i=i, _orig=idx.index_qk, **kwargs):
+                    out = _orig(*args, **kwargs)
+                    captured[_i] = (_idx, [a.detach().clone() if torch.is_tensor(a) else a for a in args],
+                                    {k_: (v_.detach().clone() if torch.is_tensor(v_) else v_) for k_, v_ in kwargs.items()},
+                                    [o.detach().clone() for o in out])
+                    return out
+
+                idx.index_qk = wrapped
 
     torch.manual_seed(7)
     align = _run(A, magi_cfg, magi_source, seq_lens, _impl_cfg(A, align_modules=("index_proj",)), hooks=install)
